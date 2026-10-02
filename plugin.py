@@ -536,7 +536,7 @@ class NekoDraw(MaiBotPlugin):
                 draw_changed = True
             if draw_changed:
                 changed = True
-                self.ctx.logger.info("画画这轮已要求：画自己先查长期记忆，再用完整句子写画面")
+                self.ctx.logger.debug("已注入条件式生图说明（不表示当前有生图任务）")
         if not changed:
             return None
         return {"action": "continue", "modified_kwargs": kwargs}
@@ -633,11 +633,18 @@ class NekoDraw(MaiBotPlugin):
             user_items = [
                 item for item in items if isinstance(item, dict) and item.get("item_type") == "UserMessageItem"
             ]
-            texts.extend(self._item_text(item) for item in user_items[-6:])
+            texts.extend(self._item_text(item) for item in user_items[-1:])
         if messages:
-            texts.extend(self._message_text(message) for message in messages[-8:])
+            user_messages = [message for message in messages if isinstance(message, dict) and message.get("role") == "user"]
+            texts.extend(self._message_text(message) for message in user_messages[-1:])
         text = "\n".join(texts)
-        return any(word in text for word in ("画", "生图", "画图", "出一张", "自画像", "draw"))
+        if re.search(r"(?:不要|别|不用|停止|取消|不需要).{0,8}(?:画|生图|生成图片)", text):
+            return False
+        return bool(re.search(
+            r"(?:^|\s)/(?:draw|生图|画图)\s+|(?:请|帮我|给我|能不能|可以).{0,8}(?:画|生成.{0,3}图)|"
+            r"(?:画一[张幅个]|画你自己|画个自己|画一下|生成一[张幅].{0,4}图)|\bdraw\s+(?:me|a|an|yourself)\b",
+            text, re.IGNORECASE,
+        ))
 
     @staticmethod
     def _system_item(text: str) -> Dict[str, Any]:
@@ -654,7 +661,7 @@ class NekoDraw(MaiBotPlugin):
     @staticmethod
     def _planner_instruction() -> str:
         return (
-            "这轮有人要求画画。"
+            "仅当当前用户确实要求生成图片时，以下生图说明才适用；历史提及、闲聊和取消请求不构成生图任务。"
             "如果画的是你自己、你的样子或自画像，先调用 query_memory，查询长期记忆里的外貌，包括发色、发型、五官、衣服和配饰。"
             "把查到的具体样子写成一段完整的话，再调用 neko_draw。不要编造记忆里没有的外貌，也不要只看人格设定。"
             "画别人，或用户已经把画面说清楚时，按当前对话写，不必为了画画去查记忆。"
