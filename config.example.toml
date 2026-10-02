@@ -1,0 +1,39 @@
+[plugin]
+enabled = true
+config_version = "1.1.0"
+
+[general]
+# 先试哪个。另一个作为失败后的备选；留空表示不备选。
+provider = "openai"
+fallback_provider = "none"
+timeout = 180
+# 超时、429、5xx 会在同一个接口上重试。首次等待 retry_delay_seconds，之后翻倍。
+retry_times = 2
+retry_delay_seconds = 2.0
+
+[command]
+# 允许使用 /draw 的 QQ 号。留空时命令不生效。麦麦自己调用生图工具不受这份名单限制。
+allowed_user_ids = []
+
+[openai]
+enabled = true
+# 可以写到域名，也可以写到 /v1。
+base_url = "https://api.openai.com/v1"
+api_key = "你的_API_Key"
+model = "gpt-image-2"
+size = "1024x1024"
+# auto：先 /v1/images/generations，失败再 /v1/chat/completions。
+# images 或 chat：只用其中一种。
+mode = "auto"
+# 国内中转留空。要走本机 mihomo 就填 http://127.0.0.1:7890。
+proxy = ""
+
+[gemini]
+enabled = false
+base_url = "https://generativelanguage.googleapis.com"
+api_key = "你的_Gemini_Key"
+model = "gemini-3.1-flash-image-preview"
+aspect_ratio = "1:1"
+# native：Gemini generateContent。openai：把上面的地址当 OpenAI 兼容网关。
+mode = "native"
+proxy = "http://127.0.0.1:7890"
