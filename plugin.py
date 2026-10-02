@@ -501,7 +501,7 @@ class NekoDraw(MaiBotPlugin):
     @HookHandler(
         "maisaka.planner.before_request",
         name="neko_draw_planner",
-        description="画图时直接根据人设和当前对话写提示词，不要先查记忆",
+        description="画图时用自然语言写画面，不要堆标签",
         mode=HookMode.BLOCKING,
         order=HookOrder.LATE,
         error_policy=ErrorPolicy.SKIP,
@@ -512,13 +512,6 @@ class NekoDraw(MaiBotPlugin):
             return None
         messages.append({"role": "system", "content": self._planner_instruction()})
         kwargs["messages"] = messages
-        tool_definitions = kwargs.get("tool_definitions")
-        if isinstance(tool_definitions, list):
-            kwargs["tool_definitions"] = [
-                item
-                for item in tool_definitions
-                if "memory" not in self._tool_definition_name(item).lower()
-            ]
         return {"action": "continue", "modified_kwargs": kwargs}
 
     @staticmethod
@@ -543,22 +536,11 @@ class NekoDraw(MaiBotPlugin):
         return any(word in text for word in ("画", "生图", "画图", "出一张", "自画像", "draw"))
 
     @staticmethod
-    def _tool_definition_name(definition: Any) -> str:
-        if not isinstance(definition, dict):
-            return ""
-        function = definition.get("function")
-        if isinstance(function, dict):
-            return str(function.get("name") or "")
-        return str(definition.get("name") or "")
-
-    @staticmethod
     def _planner_instruction() -> str:
         return (
-            "这轮是画画。直接调用 neko_draw，不要调用 query_memory，也不要为了外貌去检索记忆或历史。"
-            "人设里已经写了的发色、发型、衣服，必须原样写进 prompt，不要改成笼统的 hair 或 sweater。"
-            "prompt 用两三句自然语言描述画面，中文或英文都可以。"
+            "这轮是画画。调用 neko_draw 时，prompt 用两三句自然语言描述画面，中文或英文都可以。"
+            "外貌以人格设定里写明的发色、发型和衣服为准，再补上当前对话里的表情、动作和场景。"
             "禁止 masterpiece、best quality、1girl、solo 这类标签，也不要用逗号堆短词。"
-            "画你自己时，把人设里的具体外貌写成句子，例如发色和发型，再补上当前对话里的表情、动作和场景。"
         )
 
     @staticmethod
@@ -573,7 +555,7 @@ class NekoDraw(MaiBotPlugin):
         "neko_draw",
         brief_description="根据已经写好的画面描述生成一张图片",
         detailed_description=(
-            "用户要求画图时直接调用，不要先查记忆。"
+            "用户要求画图时调用。"
             "prompt 必须是两三句自然语言，写明人设里的发色、发型和衣服，再加上表情、动作和场景。"
             "不要使用 masterpiece、best quality、1girl、solo 或逗号分隔的标签。"
         ),
