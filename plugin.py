@@ -8,6 +8,7 @@ import base64
 import re
 import time
 import uuid
+from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional, Tuple
 from urllib.parse import urlsplit
 
@@ -506,12 +507,24 @@ class NekoDraw(MaiBotPlugin):
         order=HookOrder.LATE,
         error_policy=ErrorPolicy.SKIP,
     )
-    async def configure_planner(self, **kwargs: Any) -> Dict[str, Any]:
+    async def configure_planner(self, **kwargs: Any) -> Optional[Dict[str, Any]]:
+        items = kwargs.get("items")
         messages = kwargs.get("messages")
-        if not isinstance(messages, list) or not self._is_draw_turn(messages):
+        if not self._is_draw_turn(items if isinstance(items, list) else None, messages if isinstance(messages, list) else None):
             return None
-        messages.append({"role": "system", "content": self._planner_instruction()})
-        kwargs["messages"] = messages
+        instruction = self._planner_instruction()
+        changed = False
+        if isinstance(items, list) and instruction not in "\n".join(self._item_text(item) for item in items):
+            items.append(self._system_item(instruction))
+            kwargs["items"] = items
+            changed = True
+        if isinstance(messages, list) and instruction not in "\n".join(self._message_text(message) for message in messages):
+            messages.append({"role": "system", "content": instruction})
+            kwargs["messages"] = messages
+            changed = True
+        if not changed:
+            return None
+        self.ctx.logger.info("画画这轮已要求：画自己先查长期记忆，再用完整句子写画面")
         return {"action": "continue", "modified_kwargs": kwargs}
 
     @staticmethod
@@ -531,16 +544,60 @@ class NekoDraw(MaiBotPlugin):
             return "\n".join(parts)
         return ""
 
-    def _is_draw_turn(self, messages: List[Any]) -> bool:
-        text = "\n".join(self._message_text(message) for message in messages[-8:])
+    @staticmethod
+    def _item_text(item: Any) -> str:
+        if not isinstance(item, dict):
+            return ""
+        parts = item.get("parts")
+        if not isinstance(parts, list):
+            return str(item.get("text") or item.get("content") or "")
+        chunks: List[str] = []
+        for part in parts:
+            if isinstance(part, str):
+                chunks.append(part)
+            elif isinstance(part, dict):
+                chunks.append(str(part.get("text") or ""))
+        return "\n".join(chunks)
+
+    def _is_draw_turn(self, items: Optional[List[Any]], messages: Optional[List[Any]]) -> bool:
+        texts: List[str] = []
+        if items:
+            user_items = [
+                item for item in items if isinstance(item, dict) and item.get("item_type") == "UserMessageItem"
+            ]
+            texts.extend(self._item_text(item) for item in user_items[-6:])
+        if messages:
+            texts.extend(self._message_text(message) for message in messages[-8:])
+        text = "\n".join(texts)
         return any(word in text for word in ("画", "生图", "画图", "出一张", "自画像", "draw"))
+
+    @staticmethod
+    def _system_item(text: str) -> Dict[str, Any]:
+        return {
+            "item_type": "SystemMessageItem",
+            "meta": {
+                "item_id": uuid.uuid4().hex,
+                "logical_turn_id": None,
+                "timestamp": datetime.now().isoformat(),
+            },
+            "parts": [{"type": "text", "text": text}],
+        }
 
     @staticmethod
     def _planner_instruction() -> str:
         return (
-            "这轮是画画。调用 neko_draw 时，prompt 用两三句自然语言描述画面，中文或英文都可以。"
-            "外貌以人格设定里写明的发色、发型和衣服为准，再补上当前对话里的表情、动作和场景。"
-            "禁止 masterpiece、best quality、1girl、solo 这类标签，也不要用逗号堆短词。"
+            "这轮有人要求画画。"
+            "如果画的是你自己、你的样子或自画像，先调用 query_memory，查询长期记忆里的外貌，包括发色、发型、五官、衣服和配饰。"
+            "把查到的具体样子写成一段完整的话，再调用 neko_draw。不要编造记忆里没有的外貌，也不要只看人格设定。"
+            "画别人，或用户已经把画面说清楚时，按当前对话写，不必为了画画去查记忆。"
+            "prompt 用自然语言的完整句子。不要用逗号把短词串起来，也不要使用 masterpiece、1girl、solo 这类标签。"
+        )
+
+    @staticmethod
+    def _tag_prompt_feedback() -> str:
+        return (
+            "提示词是一串逗号短词，不能拿去生图。请改成一段完整的话。"
+            "如果画的是你自己，先调用 query_memory 查询长期记忆里的外貌，再把查到的发色、发型、五官和衣服写进句子，然后重新调用 neko_draw。"
         )
 
     @staticmethod
@@ -548,22 +605,25 @@ class NekoDraw(MaiBotPlugin):
         lowered = text.lower()
         if any(marker in lowered for marker in ("masterpiece", "best quality", "1girl", "1boy", "solo", "highres")):
             return True
-        parts = [part.strip() for part in text.split(",") if part.strip()]
-        return len(parts) >= 6 and (sum(len(part) for part in parts) / len(parts)) < 20
+        normalized = text.replace("，", ",").replace("、", ",")
+        parts = [part.strip() for part in normalized.split(",") if part.strip()]
+        if len(parts) < 8 or any(len(part) >= 18 for part in parts):
+            return False
+        return (sum(len(part) for part in parts) / len(parts)) < 12
 
     @Tool(
         "neko_draw",
         brief_description="根据已经写好的画面描述生成一张图片",
         detailed_description=(
-            "用户要求画图时调用。"
-            "prompt 必须是两三句自然语言，写明人设里的发色、发型和衣服，再加上表情、动作和场景。"
-            "不要使用 masterpiece、best quality、1girl、solo 或逗号分隔的标签。"
+            "用户要求画图时调用。画你自己或自画像时，必须先调用 query_memory 查询长期记忆里的外貌，再把查到的样子写进 prompt。"
+            "prompt 必须是一段完整的话，写明发色、发型、五官、衣服、动作和场景。不要编造记忆里没有的外貌。"
+            "不要使用 masterpiece、1girl、solo，也不要用逗号把短词串起来。"
         ),
         parameters=[
             ToolParameterInfo(
                 name="prompt",
                 param_type=ToolParamType.STRING,
-                description="两三句自然语言画面描述。画自己时必须写上人设里的具体发色，不要堆标签",
+                description="一段完整的画面描述。画自己时先查长期记忆，再写入查到的具体外貌，不要堆逗号短词",
                 required=True,
             ),
         ],
@@ -578,7 +638,7 @@ class NekoDraw(MaiBotPlugin):
         if self._is_tag_prompt(text):
             return {
                 "success": False,
-                "content": "提示词是标签堆砌。请改成两三句自然语言，并写上人设里的具体发色、发型和衣服，然后重新调用 neko_draw。",
+                "content": self._tag_prompt_feedback(),
             }
         if not stream_id:
             return {"success": False, "content": "找不到当前聊天"}
@@ -629,7 +689,7 @@ class NekoDraw(MaiBotPlugin):
         if not payload or payload in {"status", "状态"}:
             return True, self._status_text(stream_id), True
         if self._is_tag_prompt(payload):
-            return False, "请用两三句自然语言描述画面，不要堆 masterpiece、1girl 这种标签。", True
+            return False, self._tag_prompt_feedback(), True
         active = self._active_task(stream_id)
         if active is not None:
             return False, "上一张还没画完。\n" + active.summary(), True
