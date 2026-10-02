@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import re
 import time
 import uuid
@@ -20,6 +21,10 @@ from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParameterInfo
 
 MARKDOWN_IMAGE = re.compile(r"!\[[^\]]*]\(([^)\s]+)\)")
 DATA_URL = re.compile(r"data:image/[\w.+-]+;base64,([A-Za-z0-9+/=\s]+)", re.IGNORECASE)
+
+
+class PromptRejected(RuntimeError):
+    """接口返回 HTTP 400。生图里这通常是提示词违规，不应该重试。"""
 
 
 class PluginSection(PluginConfigBase):
@@ -140,6 +145,7 @@ class NekoDraw(MaiBotPlugin):
         self._tasks: Dict[str, DrawTask] = {}
         self._latest_by_stream: Dict[str, str] = {}
         self._runners: Dict[str, asyncio.Task] = {}
+        self._policy_notice: Dict[str, str] = {}
         self._preferred_openai_mode = ""
 
     async def on_load(self) -> None:
@@ -184,6 +190,8 @@ class NekoDraw(MaiBotPlugin):
         request_proxy = proxy.strip() or None
         async with session.post(url, json=payload, headers=headers, proxy=request_proxy) as response:
             text = await response.text()
+            if response.status == 400:
+                raise PromptRejected(f"HTTP 400：{text[:500]}")
             if response.status != 200:
                 raise RuntimeError(f"HTTP {response.status}：{text[:500]}")
             try:
@@ -350,6 +358,8 @@ class NekoDraw(MaiBotPlugin):
                 image = await self._call_with_retry(task, f"openai/{name}", lambda method=method: method(prompt, cfg))
                 self._preferred_openai_mode = name
                 return image
+            except PromptRejected:
+                raise
             except Exception as exc:
                 errors.append(str(exc))
                 if cfg.mode != "auto":
@@ -423,11 +433,10 @@ class NekoDraw(MaiBotPlugin):
                     return await self._openai(prompt, task), name
                 if name == "gemini":
                     return await self._gemini(prompt, task), name
+            except PromptRejected:
+                raise
             except Exception as exc:
-                message = str(exc)
-                for secret in (self.config.openai.api_key.strip(), self.config.gemini.api_key.strip()):
-                    if secret:
-                        message = message.replace(secret, "***")
+                message = self._redact(str(exc))
                 errors.append(f"{name}: {message}")
                 self.ctx.logger.warning("生图接口失败：%s", errors[-1][:500])
         raise RuntimeError("；".join(errors) or "没有可用的生图接口")
@@ -476,6 +485,7 @@ class NekoDraw(MaiBotPlugin):
             return active
         task = DrawTask(uuid.uuid4().hex[:8], stream_id, prompt, user_id)
         task.max_attempts = self.config.general.retry_times + 1
+        self._policy_notice.pop(stream_id, None)
         self._remember_task(task)
         self._runners[task.task_id] = asyncio.create_task(self._run_task(task))
         return task
@@ -489,11 +499,13 @@ class NekoDraw(MaiBotPlugin):
         except asyncio.CancelledError:
             task.touch("failed", error="插件已卸载，任务取消")
             raise
+        except PromptRejected as exc:
+            message = self._policy_feedback(task.prompt, str(exc))
+            task.touch("failed", error=message)
+            self._policy_notice[task.stream_id] = message
+            self.ctx.logger.info("任务 %s 被接口以 400 拒绝：%s", task.task_id, message[:300])
         except Exception as exc:
-            message = str(exc)
-            for secret in (self.config.openai.api_key.strip(), self.config.gemini.api_key.strip()):
-                if secret:
-                    message = message.replace(secret, "***")
+            message = self._redact(str(exc))
             task.touch("failed", error=message)
             self.ctx.logger.error("任务 %s 失败：%s", task.task_id, message[:500])
         finally:
@@ -508,24 +520,80 @@ class NekoDraw(MaiBotPlugin):
         error_policy=ErrorPolicy.SKIP,
     )
     async def configure_planner(self, **kwargs: Any) -> Optional[Dict[str, Any]]:
+        changed = self._consume_policy_notice(kwargs)
         items = kwargs.get("items")
         messages = kwargs.get("messages")
-        if not self._is_draw_turn(items if isinstance(items, list) else None, messages if isinstance(messages, list) else None):
-            return None
-        instruction = self._planner_instruction()
-        changed = False
-        if isinstance(items, list) and instruction not in "\n".join(self._item_text(item) for item in items):
-            items.append(self._system_item(instruction))
-            kwargs["items"] = items
-            changed = True
-        if isinstance(messages, list) and instruction not in "\n".join(self._message_text(message) for message in messages):
-            messages.append({"role": "system", "content": instruction})
-            kwargs["messages"] = messages
-            changed = True
+        if self._is_draw_turn(items if isinstance(items, list) else None, messages if isinstance(messages, list) else None):
+            instruction = self._planner_instruction()
+            draw_changed = False
+            if isinstance(items, list) and instruction not in "\n".join(self._item_text(item) for item in items):
+                items.append(self._system_item(instruction))
+                kwargs["items"] = items
+                draw_changed = True
+            if isinstance(messages, list) and instruction not in "\n".join(self._message_text(message) for message in messages):
+                messages.append({"role": "system", "content": instruction})
+                kwargs["messages"] = messages
+                draw_changed = True
+            if draw_changed:
+                changed = True
+                self.ctx.logger.info("画画这轮已要求：画自己先查长期记忆，再用完整句子写画面")
         if not changed:
             return None
-        self.ctx.logger.info("画画这轮已要求：画自己先查长期记忆，再用完整句子写画面")
         return {"action": "continue", "modified_kwargs": kwargs}
+
+    def _redact(self, message: str) -> str:
+        for secret in (self.config.openai.api_key.strip(), self.config.gemini.api_key.strip()):
+            if secret:
+                message = message.replace(secret, "***")
+        return message
+
+    @staticmethod
+    def _api_error_detail(raw: str) -> str:
+        body = raw.split("：", 1)[-1].strip()
+        try:
+            data = json.loads(body)
+        except Exception:
+            return ""
+        if not isinstance(data, dict):
+            return ""
+        error = data.get("error")
+        if isinstance(error, dict):
+            return str(error.get("message") or "").strip()
+        if isinstance(error, str):
+            return error.strip()
+        return str(data.get("message") or "").strip()
+
+    def _policy_feedback(self, prompt: str, raw: str) -> str:
+        detail = self._api_error_detail(self._redact(raw))
+        lines = [
+            "生图接口返回 HTTP 400，一般是提示词违规，这张没有画成。",
+            "不要用同一句提示词再试。改掉可能违规的内容后，重新调用 neko_draw。",
+            f"被拒绝的提示词：{prompt[:180]}",
+        ]
+        if detail:
+            lines.append(f"接口说明：{detail[:180]}")
+        return "\n".join(lines)
+
+    def _consume_policy_notice(self, kwargs: Dict[str, Any]) -> bool:
+        stream_id = str(kwargs.get("session_id") or kwargs.get("stream_id") or "").strip()
+        notice = self._policy_notice.get(stream_id, "")
+        if not stream_id or not notice:
+            return False
+        delivered = False
+        items = kwargs.get("items")
+        if isinstance(items, list):
+            items.append(self._system_item(notice))
+            kwargs["items"] = items
+            delivered = True
+        messages = kwargs.get("messages")
+        if isinstance(messages, list):
+            messages.append({"role": "system", "content": notice})
+            kwargs["messages"] = messages
+            delivered = True
+        if delivered:
+            self._policy_notice.pop(stream_id, None)
+            self.ctx.logger.info("已把生图 400 反馈交给规划器：%s", stream_id)
+        return delivered
 
     @staticmethod
     def _message_text(message: Any) -> str:

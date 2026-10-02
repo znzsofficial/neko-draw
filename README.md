@@ -11,6 +11,8 @@ MaiBot 生图插件，只保留两条路：
 
 画自己或自画像时，先用 `query_memory` 查长期记忆里的外貌，再写成一段完整的话。外貌不从人格设定里取，也不要编。画别人时按当前对话写。`masterpiece`、`1girl` 和一串逗号短词会被退回。
 
+接口返回 HTTP 400 时不重试，也不改走另一个接口。下一轮规划会收到反馈：这一般是提示词违规，不要用同一句再试，改写后再调用 `neko_draw`。
+
 同一个接口遇到超时、429 或 5xx 会按 `retry_times` 重试，等待时间从 `retry_delay_seconds` 起翻倍。OpenAI 的 `auto` 模式会记住上次成功的路径，下次先走那条。同一聊天里上一张没画完时不会再开新任务。
 
 复制 `config.example.toml` 为 `config.toml` 后填写密钥。不要把 `config.toml` 提交进仓库。
