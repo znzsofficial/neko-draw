@@ -49,6 +49,31 @@ class Sources(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             extract(m)
 
+    async def test_current_and_quoted_images_survive_cache_and_stripping(self):
+        own = message('own')
+        own['reply_to'] = 'quoted'
+        quoted = message('quoted')
+        other = PNG + b'distinct'
+        quoted['message_segments'][0]['binary_data_base64'] = base64.b64encode(other).decode()
+        stripped = {'message_id': 'own', 'reply_to': 'quoted', 'message_segments': [{'type': 'image'}]}
+        for cached in (False, True):
+            cache = ImageCache()
+            if cached:
+                cache.put('chat', own)
+            async def get(cap, **kw):
+                self.assertEqual(kw['chat_id'], 'chat')
+                return {'message': (stripped if cached else own) if kw['message_id'] == 'own' else quoted}
+            ctx = types.SimpleNamespace(call_capability=AsyncMock(side_effect=get))
+            self.assertEqual(await resolve_images(ctx, 'chat', current=stripped, cache=cache), [PNG, other])
+            self.assertEqual(await resolve_images(ctx, 'chat', 'own', cache=cache), [PNG, other])
+
+    async def test_quote_cycle_is_bounded(self):
+        m = message('self')
+        m['reply_to'] = 'self'
+        ctx = types.SimpleNamespace(call_capability=AsyncMock(return_value={'message': m}))
+        self.assertEqual(await resolve_images(ctx, 'chat', 'self'), [PNG])
+        self.assertEqual(ctx.call_capability.call_count, 1)
+
 
 @unittest.skipUnless(importlib.util.find_spec('maibot_sdk'), 'requires MaiBot SDK (run on server)')
 class Providers(unittest.IsolatedAsyncioTestCase):
@@ -102,6 +127,23 @@ class Providers(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, PNG)
         parts = post.call_args.args[1]['contents'][0]['parts']
         self.assertEqual(parts[1]['inlineData'], {'mimeType': 'image/png', 'data': encoded})
+
+    async def test_generation_and_edit_route_preferences_are_independent(self):
+        async def retry(task, label, fn):
+            return await fn()
+        images = AsyncMock(return_value=PNG)
+        chat = AsyncMock(return_value=PNG)
+        bot = types.SimpleNamespace(config=types.SimpleNamespace(openai=self.mod.OpenAIConfig(api_key='test', mode='auto')),
+                                    _preferred_openai_mode='chat', _preferred_openai_edit_mode='',
+                                    _openai_images=images, _openai_chat=chat, _call_with_retry=retry)
+        task = types.SimpleNamespace(images=[PNG])
+        await self.mod.NekoDraw._openai(bot, 'edit', task)
+        images.assert_awaited_once()
+        chat.assert_not_awaited()
+        self.assertEqual(bot._preferred_openai_mode, 'chat')
+        self.assertEqual(bot._preferred_openai_edit_mode, 'images')
+        await self.mod.NekoDraw._openai(bot, 'generate')
+        chat.assert_awaited_once()
 
 
 if __name__ == '__main__':

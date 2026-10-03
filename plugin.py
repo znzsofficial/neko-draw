@@ -149,6 +149,7 @@ class NekoDraw(MaiBotPlugin):
         self._runners: Dict[str, asyncio.Task] = {}
         self._policy_notice: Dict[str, str] = {}
         self._preferred_openai_mode = ""
+        self._preferred_openai_edit_mode = ""
         self._image_cache = ImageCache()
 
     @HookHandler("chat.receive.before_process", name="neko_source_images",
@@ -185,6 +186,7 @@ class NekoDraw(MaiBotPlugin):
         del scope, config_data
         await self.on_unload()
         self._preferred_openai_mode = ""
+        self._preferred_openai_edit_mode = ""
         self.ctx.logger.info("生图配置已热重载：version=%s", version)
 
     async def _http(self) -> aiohttp.ClientSession:
@@ -384,11 +386,13 @@ class NekoDraw(MaiBotPlugin):
         cfg = self.config.openai
         if not cfg.enabled:
             raise RuntimeError("OpenAI 未启用")
+        editing = bool(task and task.images)
+        preferred = self._preferred_openai_edit_mode if editing else self._preferred_openai_mode
         if cfg.mode == "images":
             route_names = ["images"]
         elif cfg.mode == "chat":
             route_names = ["chat"]
-        elif self._preferred_openai_mode == "chat":
+        elif preferred == "chat":
             route_names = ["chat", "images"]
         else:
             route_names = ["images", "chat"]
@@ -397,7 +401,10 @@ class NekoDraw(MaiBotPlugin):
         for name, method in methods:
             try:
                 image = await self._call_with_retry(task, f"openai/{name}", lambda method=method: method(prompt, cfg, task.images if task else None))
-                self._preferred_openai_mode = name
+                if editing:
+                    self._preferred_openai_edit_mode = name
+                else:
+                    self._preferred_openai_mode = name
                 return image
             except PromptRejected:
                 raise

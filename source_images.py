@@ -97,12 +97,17 @@ async def resolve_images(ctx, stream_id, message_id='', current=None, cache=None
             return []
         seen.add(mid)
         cached = cache.get(stream_id, mid) if cache else []
-        if cached:
-            return cached
         result = await ctx.call_capability('message.get_by_id', chat_id=stream_id,
                                           message_id=mid, include_binary_data=True)
         messages = unwrap(result)
-        return await collect(messages[0], depth) if messages else []
+        images = list(cached)
+        if messages:
+            for image in await collect(messages[0], depth):
+                if image not in images:
+                    images.append(image)
+        if len(images) > MAX_IMAGES:
+            raise ValueError('一次最多使用 4 张源图')
+        return images
 
     async def collect(message, depth=0):
         images = extract(message)
@@ -133,11 +138,16 @@ async def resolve_images(ctx, stream_id, message_id='', current=None, cache=None
     if message_id:
         images = await lookup(message_id)
     elif isinstance(current, dict):
-        images = await collect(current)
-        if not images:
-            images = await lookup(current.get('message_id'))
+        # Restore this message before collecting its quotes. A successful quote
+        # must not suppress retrieval of the stripped current image.
+        images = await lookup(current.get('message_id'))
+        for image in await collect(current):
+            if image not in images:
+                images.append(image)
     else:
         images = []
+    if len(images) > MAX_IMAGES:
+        raise ValueError('一次最多使用 4 张源图')
     if not images:
         raise ValueError('指定消息或引用里没有可读取的原图。请重新发送图片，并引用它使用 /draw edit <修改要求>')
     return images
