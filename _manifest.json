@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "neko.draw",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "name": "Neko 生图",
   "description": "只用 OpenAI 兼容接口和 Gemini 生图。OpenAI 失败时可以自动改走 Gemini。",
   "author": { "name": "NekoLaska", "url": "https://github.com/znzsofficial" },
@@ -15,6 +15,6 @@
   "dependencies": [
     { "type": "python_package", "name": "aiohttp", "version_spec": ">=3.0" }
   ],
-  "capabilities": ["send.image"],
+  "capabilities": ["send.image", "message.get_by_id"],
   "i18n": { "default_locale": "zh-CN", "supported_locales": ["zh-CN"] }
 }

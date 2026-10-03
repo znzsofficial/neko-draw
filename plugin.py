@@ -17,6 +17,7 @@ import aiohttp
 
 from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParameterInfo, ToolParamType
+from .source_images import ImageCache, mime_type, resolve_images
 
 
 MARKDOWN_IMAGE = re.compile(r"!\[[^\]]*]\(([^)\s]+)\)")
@@ -101,6 +102,7 @@ class DrawTask:
         self.prompt = prompt
         self.user_id = user_id
         self.status = "queued"
+        self.images: List[bytes] = []
         self.attempt = 0
         self.max_attempts = 1
         self.provider = ""
@@ -135,7 +137,7 @@ class DrawTask:
 
 
 class NekoDraw(MaiBotPlugin):
-    """文生图。OpenAI 不稳定时自动改走 Gemini。"""
+    """文生图与图生图，共用后台任务与配置的备选提供商。"""
 
     config_model = PluginConfig
 
@@ -147,6 +149,19 @@ class NekoDraw(MaiBotPlugin):
         self._runners: Dict[str, asyncio.Task] = {}
         self._policy_notice: Dict[str, str] = {}
         self._preferred_openai_mode = ""
+        self._image_cache = ImageCache()
+
+    @HookHandler("chat.receive.before_process", name="neko_source_images",
+                 description="缓存本聊天入站原图供图生图使用", mode=HookMode.OBSERVE)
+    async def cache_source_images(self, message: Any = None, stream_id: str = "", **kwargs: Any) -> None:
+        if not self.config.plugin.enabled or not isinstance(message, dict):
+            return
+        stream = str(stream_id or kwargs.get("session_id") or message.get("session_id") or message.get("chat_id") or message.get("stream_id") or "")
+        if stream:
+            try:
+                self._image_cache.put(stream, message)
+            except (ValueError, TypeError):
+                self.ctx.logger.debug("入站图片无法缓存，图生图时可尝试按消息 ID 读取")
 
     async def on_load(self) -> None:
         if not self.config.plugin.enabled:
@@ -286,10 +301,31 @@ class NekoDraw(MaiBotPlugin):
                     return [parsed]
         return []
 
-    async def _openai_images(self, prompt: str, cfg: OpenAIConfig) -> bytes:
+    async def _openai_images(self, prompt: str, cfg: OpenAIConfig, images: Optional[List[bytes]] = None) -> bytes:
         if not cfg.api_key.strip():
             raise RuntimeError("未配置 OpenAI API Key")
         root = self._root(cfg.base_url)
+        if images:
+            form = aiohttp.FormData()
+            form.add_field("model", cfg.model.strip())
+            form.add_field("prompt", prompt)
+            form.add_field("n", "1")
+            if cfg.size.strip():
+                form.add_field("size", cfg.size.strip())
+            for i, image in enumerate(images):
+                mime = mime_type(image)
+                form.add_field("image[]", image, filename=f"source-{i}.{mime.split('/')[-1]}", content_type=mime)
+            session = await self._http()
+            async with session.post(f"{root}/v1/images/edits", data=form,
+                                    headers={"Authorization": f"Bearer {cfg.api_key.strip()}"},
+                                    proxy=cfg.proxy.strip() or None) as response:
+                text = await response.text()
+                if response.status == 400:
+                    raise PromptRejected(f"HTTP 400：{text[:500]}")
+                if response.status != 200:
+                    raise RuntimeError(f"HTTP {response.status}：{text[:500]}")
+                body = await response.json(content_type=None)
+            return (await self._images_from_openai_body(body, cfg.proxy))[0]
         headers = {"Authorization": f"Bearer {cfg.api_key.strip()}", "Content-Type": "application/json"}
         payload: Dict[str, Any] = {"model": cfg.model.strip(), "prompt": prompt, "n": 1}
         if cfg.size.strip():
@@ -299,14 +335,19 @@ class NekoDraw(MaiBotPlugin):
         body = await self._post_json(f"{root}/v1/images/generations", payload, headers, cfg.proxy)
         return (await self._images_from_openai_body(body, cfg.proxy))[0]
 
-    async def _openai_chat(self, prompt: str, cfg: OpenAIConfig) -> bytes:
+    async def _openai_chat(self, prompt: str, cfg: OpenAIConfig, images: Optional[List[bytes]] = None) -> bytes:
         if not cfg.api_key.strip():
             raise RuntimeError("未配置 OpenAI API Key")
         root = self._root(cfg.base_url)
         headers = {"Authorization": f"Bearer {cfg.api_key.strip()}", "Content-Type": "application/json"}
         payload = {
             "model": cfg.model.strip(),
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [{"role": "user", "content": (
+                [{"type": "text", "text": prompt}] + [
+                    {"type": "image_url", "image_url": {"url": f"data:{mime_type(image)};base64,{base64.b64encode(image).decode('ascii')}"}}
+                    for image in images
+                ] if images else prompt
+            )}],
             "stream": False,
         }
         body = await self._post_json(f"{root}/v1/chat/completions", payload, headers, cfg.proxy)
@@ -355,7 +396,7 @@ class NekoDraw(MaiBotPlugin):
         errors: List[str] = []
         for name, method in methods:
             try:
-                image = await self._call_with_retry(task, f"openai/{name}", lambda method=method: method(prompt, cfg))
+                image = await self._call_with_retry(task, f"openai/{name}", lambda method=method: method(prompt, cfg, task.images if task else None))
                 self._preferred_openai_mode = name
                 return image
             except PromptRejected:
@@ -366,7 +407,7 @@ class NekoDraw(MaiBotPlugin):
                     break
         raise RuntimeError("；".join(errors) or "OpenAI 生图失败")
 
-    async def _gemini_native(self, prompt: str) -> bytes:
+    async def _gemini_native(self, prompt: str, images: Optional[List[bytes]] = None) -> bytes:
         cfg = self.config.gemini
         if not cfg.api_key.strip():
             raise RuntimeError("未配置 Gemini API Key")
@@ -382,7 +423,10 @@ class NekoDraw(MaiBotPlugin):
         else:
             headers["Authorization"] = f"Bearer {cfg.api_key.strip()}"
         payload: Dict[str, Any] = {
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "contents": [{"role": "user", "parts": [{"text": prompt}] + [
+                {"inlineData": {"mimeType": mime_type(image), "data": base64.b64encode(image).decode("ascii")}}
+                for image in (images or [])
+            ]}],
             "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
         }
         if cfg.aspect_ratio.strip():
@@ -418,8 +462,8 @@ class NekoDraw(MaiBotPlugin):
                 mode="chat",
                 proxy=cfg.proxy,
             )
-            return await self._call_with_retry(task, "gemini/openai", lambda: self._openai_chat(prompt, mirrored))
-        return await self._call_with_retry(task, "gemini", lambda: self._gemini_native(prompt))
+            return await self._call_with_retry(task, "gemini/openai", lambda: self._openai_chat(prompt, mirrored, task.images if task else None))
+        return await self._call_with_retry(task, "gemini", lambda: self._gemini_native(prompt, task.images if task else None))
 
     async def _generate(self, prompt: str, task: Optional[DrawTask] = None) -> Tuple[bytes, str]:
         order = [self.config.general.provider]
@@ -479,11 +523,12 @@ class NekoDraw(MaiBotPlugin):
             return "这个聊天还没有生图任务"
         return task.summary()
 
-    def _start_task(self, stream_id: str, prompt: str, user_id: str) -> DrawTask:
+    def _start_task(self, stream_id: str, prompt: str, user_id: str, images: Optional[List[bytes]] = None) -> DrawTask:
         active = self._active_task(stream_id)
         if active is not None:
             return active
         task = DrawTask(uuid.uuid4().hex[:8], stream_id, prompt, user_id)
+        task.images = images or []
         task.max_attempts = self.config.general.retry_times + 1
         self._policy_notice.pop(stream_id, None)
         self._remember_task(task)
@@ -509,6 +554,7 @@ class NekoDraw(MaiBotPlugin):
             task.touch("failed", error=message)
             self.ctx.logger.error("任务 %s 失败：%s", task.task_id, message[:500])
         finally:
+            task.images = []
             self._runners.pop(task.task_id, None)
 
     @HookHandler(
@@ -566,8 +612,8 @@ class NekoDraw(MaiBotPlugin):
     def _policy_feedback(self, prompt: str, raw: str) -> str:
         detail = self._api_error_detail(self._redact(raw))
         lines = [
-            "生图接口返回 HTTP 400，一般是提示词违规，这张没有画成。",
-            "不要用同一句提示词再试。改掉可能违规的内容后，重新调用 neko_draw。",
+            "生图接口返回 HTTP 400，这张没有画成。可能是内容审核，也可能是模型、尺寸或源图参数不兼容。",
+            "按接口说明处理；明确被内容审核拒绝时停止原请求，说明原因。参数错误应修正参数，不要盲目重复提交或丢掉原图改成文生图。",
             f"被拒绝的提示词：{prompt[:180]}",
         ]
         if detail:
@@ -662,7 +708,8 @@ class NekoDraw(MaiBotPlugin):
     def _planner_instruction() -> str:
         return (
             "仅当当前用户确实要求生成图片时，以下生图说明才适用；历史提及、闲聊和取消请求不构成生图任务。"
-            "如果画的是你自己、你的样子或自画像，先调用 query_memory，查询长期记忆里的外貌，包括发色、发型、五官、衣服和配饰。"
+            "有原图的修改、重绘、换装、换背景请调用 neko_edit_image，传入原图消息 ID，以原图为依据，不用查记忆重建外貌。"
+            "以下仅针对无原图的文生图：如果画的是你自己、你的样子或自画像，先调用 query_memory，查询长期记忆里的外貌，包括发色、发型、五官、衣服和配饰。"
             "把查到的具体样子写成一段完整的话，再调用 neko_draw。不要编造记忆里没有的外貌，也不要只看人格设定。"
             "画别人，或用户已经把画面说清楚时，按当前对话写，不必为了画画去查记忆。"
             "prompt 用自然语言的完整句子。不要用逗号把短词串起来，也不要使用 masterpiece、1girl、solo 这类标签。"
@@ -690,7 +737,7 @@ class NekoDraw(MaiBotPlugin):
         "neko_draw",
         brief_description="根据已经写好的画面描述生成一张图片",
         detailed_description=(
-            "用户要求画图时调用。画你自己或自画像时，必须先调用 query_memory 查询长期记忆里的外貌，再把查到的样子写进 prompt。"
+            "仅用于无原图的文生图。有原图的修改或重绘使用 neko_edit_image。画你自己或自画像时，先调用 query_memory 查询长期记忆里的外貌，再把查到的样子写进 prompt。"
             "prompt 必须是一段完整的话，写明发色、发型、五官、衣服、动作和场景。不要编造记忆里没有的外貌。"
             "不要使用 masterpiece、1girl、solo，也不要用逗号把短词串起来。"
         ),
@@ -725,6 +772,35 @@ class NekoDraw(MaiBotPlugin):
             "success": True,
             "content": "已经开始画了，画好会直接发到聊天里。可以过一会儿再查状态。\n" + task.summary(),
         }
+
+    @Tool(
+        "neko_edit_image",
+        brief_description="基于聊天里的原图进行图生图或修改图片",
+        detailed_description=(
+            "用户要求修改这张图、换背景、换装、重绘、参考原图时调用。"
+            "source_message_id 填当前聊天中含原图或引用原图的真实消息 ID，不能编造。"
+            "prompt 用自然语言说明修改什么、保留什么。原图作为视觉依据，不需要查记忆重建外貌。"
+            "找不到原图就请用户补发，不要改用文生图冒充图生图。"
+        ),
+        parameters=[
+            ToolParameterInfo(name="prompt", param_type=ToolParamType.STRING, description="自然语言的修改要求和保留内容", required=True),
+            ToolParameterInfo(name="source_message_id", param_type=ToolParamType.STRING, description="当前聊天中原图消息或引用消息的真实 ID", required=True),
+        ],
+    )
+    async def edit_image(self, prompt: str = "", source_message_id: str = "", **kwargs: Any) -> Dict[str, Any]:
+        stream_id = self._stream_id(kwargs)
+        if not self.config.plugin.enabled or not stream_id or not prompt.strip():
+            return {"success": False, "content": "插件未启用、聊天缺失或修改要求为空"}
+        if self._active_task(stream_id):
+            return {"success": False, "content": "上一张还没画完。\n" + self._status_text(stream_id)}
+        try:
+            images = await resolve_images(self.ctx, stream_id, source_message_id.strip(), kwargs.get("message"), self._image_cache)
+        except Exception as exc:
+            return {"success": False, "content": "无法取得原图：" + self._redact(str(exc))[:300]}
+        if self._active_task(stream_id):
+            return {"success": False, "content": "上一张还没画完。\n" + self._status_text(stream_id)}
+        task = self._start_task(stream_id, prompt.strip(), str(kwargs.get("user_id") or ""), images)
+        return {"success": True, "content": f"已使用 {len(images)} 张原图开始图生图，完成后直接发图。\n" + task.summary()}
 
     @Tool(
         "neko_draw_status",
@@ -763,6 +839,12 @@ class NekoDraw(MaiBotPlugin):
         payload = str((matched_groups or {}).get("payload") or "").strip()
         if not payload or payload in {"status", "状态"}:
             return True, self._status_text(stream_id), True
+        parts = payload.split(maxsplit=1)
+        if parts[0].lower() in {"edit", "图生图", "改图"}:
+            if len(parts) < 2:
+                return False, "请引用原图，发送 /draw edit <修改要求>", True
+            result = await self.edit_image(prompt=parts[1], stream_id=stream_id, user_id=sender, **kwargs)
+            return bool(result["success"]), str(result["content"]), True
         if self._is_tag_prompt(payload):
             return False, self._tag_prompt_feedback(), True
         active = self._active_task(stream_id)
