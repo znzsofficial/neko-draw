@@ -719,7 +719,7 @@ class NekoDraw(MaiBotPlugin):
             "以下仅针对无原图的文生图：如果画的是你自己、你的样子或自画像，先调用 query_memory，查询长期记忆里的外貌，包括发色、发型、五官、衣服和配饰。"
             "把查到的具体样子写成一段完整的话，再调用 neko_draw。不要编造记忆里没有的外貌，也不要只看人格设定。"
             "画别人，或用户已经把画面说清楚时，按当前对话写，不必为了画画去查记忆。"
-            "prompt 用自然语言的完整句子。不要用逗号把短词串起来，也不要使用 masterpiece、1girl、solo 这类标签。"
+            "prompt 写成能看懂的画面描述。不要使用 masterpiece、1girl、solo 这类标签；中文里用逗号分开外貌和镜头是可以的。"
         )
 
     @staticmethod
@@ -735,24 +735,30 @@ class NekoDraw(MaiBotPlugin):
         if any(marker in lowered for marker in ("masterpiece", "best quality", "1girl", "1boy", "solo", "highres")):
             return True
         normalized = text.replace("，", ",").replace("、", ",")
-        parts = [part.strip() for part in normalized.split(",") if part.strip()]
-        if len(parts) < 8 or any(len(part) >= 18 for part in parts):
+        parts = [part.strip(" 。.!?！？") for part in normalized.split(",") if part.strip(" 。.!?！？")]
+        if len(parts) < 8:
             return False
-        return (sum(len(part) for part in parts) / len(parts)) < 12
+        # 中文描述常常用逗号切开，但句子里会有「的 / 着 / 了」，或者某一截已经是短语。
+        cjk = sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
+        if cjk >= 8 and any(len(part) >= 8 or any(mark in part for mark in ("的", "着", "了")) for part in parts):
+            return False
+        if any(len(part) >= 24 for part in parts):
+            return False
+        return sum(len(part) for part in parts) / len(parts) < 8
 
     @Tool(
         "neko_draw",
         brief_description="根据已经写好的画面描述生成一张图片",
         detailed_description=(
             "仅用于无原图的文生图。有原图的修改或重绘使用 neko_edit_image。画你自己或自画像时，先调用 query_memory 查询长期记忆里的外貌，再把查到的样子写进 prompt。"
-            "prompt 必须是一段完整的话，写明发色、发型、五官、衣服、动作和场景。不要编造记忆里没有的外貌。"
-            "不要使用 masterpiece、1girl、solo，也不要用逗号把短词串起来。"
+            "prompt 写明发色、发型、五官、衣服、动作和场景。不要编造记忆里没有的外貌。"
+            "不要使用 masterpiece、1girl、solo。中文描述可以用逗号分隔，不要只堆没有语法的标签。"
         ),
         parameters=[
             ToolParameterInfo(
                 name="prompt",
                 param_type=ToolParamType.STRING,
-                description="一段完整的画面描述。画自己时先查长期记忆，再写入查到的具体外貌，不要堆逗号短词",
+                description="画面描述。画自己时先查长期记忆，再写入查到的具体外貌。不要堆 masterpiece、1girl 这类标签",
                 required=True,
             ),
         ],
