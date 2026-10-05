@@ -18,6 +18,8 @@ import aiohttp
 from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParameterInfo, ToolParamType
 from .source_images import ImageCache, mime_type, resolve_images
+from .public_http import PublicClient, download_public, local_addresses
+from .result_images import MAX_IMAGE_BYTES, decode_image, read_response, validate_image
 
 
 MARKDOWN_IMAGE = re.compile(r"!\[[^\]]*]\(([^)\s]+)\)")
@@ -175,8 +177,16 @@ class NekoDraw(MaiBotPlugin):
         )
 
     async def on_unload(self) -> None:
-        for runner in self._runners.values():
+        runners = list(self._runners.values())
+        for runner in runners:
             runner.cancel()
+        if runners:
+            await asyncio.gather(*runners, return_exceptions=True)
+        # A task cancelled before its coroutine starts never executes finally.
+        for task in self._tasks.values():
+            if task.status in {"queued", "running", "retrying"}:
+                task.touch("failed", error="插件已卸载，任务取消")
+            task.images = []
         self._runners.clear()
         if self._session is not None and not self._session.closed:
             await self._session.close()
@@ -206,13 +216,14 @@ class NekoDraw(MaiBotPlugin):
         session = await self._http()
         request_proxy = proxy.strip() or None
         async with session.post(url, json=payload, headers=headers, proxy=request_proxy) as response:
-            text = await response.text()
+            raw = await read_response(response)
+            text = raw.decode("utf-8", "replace")
             if response.status == 400:
                 raise PromptRejected(f"HTTP 400：{text[:500]}")
             if response.status != 200:
                 raise RuntimeError(f"HTTP {response.status}：{text[:500]}")
             try:
-                data = await response.json(content_type=None)
+                data = json.loads(raw)
             except Exception as exc:
                 raise RuntimeError("接口返回了非 JSON") from exc
         if not isinstance(data, dict):
@@ -220,26 +231,26 @@ class NekoDraw(MaiBotPlugin):
         return data
 
     async def _download(self, url: str, proxy: str) -> bytes:
-        session = await self._http()
-        async with session.get(url, proxy=proxy.strip() or None) as response:
-            body = await response.read()
-            if response.status != 200 or len(body) < 32:
-                raise RuntimeError(f"下载图片失败：HTTP {response.status}")
-            return body
+        async with PublicClient(timeout=self.config.general.timeout, proxy=proxy.strip() or None) as client:
+            body, _, _ = await download_public(client, url, max_image_bytes=MAX_IMAGE_BYTES,
+                                                blocked_ips=local_addresses())
+        return await asyncio.to_thread(validate_image, body)
 
     async def _bytes_from_reference(self, value: str, proxy: str) -> Optional[bytes]:
         text = value.strip()
         if not text:
             return None
+        if len(text) > 24 * 1024 * 1024:
+            raise ValueError("生成图片引用超过大小限制")
         data_match = DATA_URL.search(text)
         if data_match:
-            return base64.b64decode(re.sub(r"\s+", "", data_match.group(1)))
+            return await asyncio.to_thread(decode_image, data_match.group(1))
         if text.startswith("http://") or text.startswith("https://"):
             return await self._download(text, proxy)
         compact = re.sub(r"\s+", "", text)
         if len(compact) > 200 and re.fullmatch(r"[A-Za-z0-9+/=]+", compact):
             try:
-                decoded = base64.b64decode(compact, validate=True)
+                decoded = await asyncio.to_thread(decode_image, compact)
             except Exception:
                 return None
             if decoded.startswith(b"\x89PNG") or decoded.startswith(b"\xff\xd8") or decoded.startswith(b"RIFF"):
@@ -257,7 +268,7 @@ class NekoDraw(MaiBotPlugin):
                 if isinstance(raw, str):
                     parsed = await self._bytes_from_reference(raw, proxy)
                     if parsed:
-                        images.append(parsed)
+                        return [parsed]
         if images:
             return images
 
@@ -278,6 +289,8 @@ class NekoDraw(MaiBotPlugin):
                     blobs.extend(extra)
                 for blob in blobs:
                     images.extend(await self._images_from_content(blob, proxy))
+                    if images:
+                        return images[:1]
         if not images:
             raise RuntimeError("响应里没有图片")
         return images
@@ -289,7 +302,7 @@ class NekoDraw(MaiBotPlugin):
             for reference in references:
                 parsed = await self._bytes_from_reference(reference, proxy)
                 if parsed:
-                    found.append(parsed)
+                    return [parsed]
             return found
         if not isinstance(item, dict):
             return []
@@ -321,12 +334,13 @@ class NekoDraw(MaiBotPlugin):
             async with session.post(f"{root}/v1/images/edits", data=form,
                                     headers={"Authorization": f"Bearer {cfg.api_key.strip()}"},
                                     proxy=cfg.proxy.strip() or None) as response:
-                text = await response.text()
+                raw = await read_response(response)
+                text = raw.decode("utf-8", "replace")
                 if response.status == 400:
                     raise PromptRejected(f"HTTP 400：{text[:500]}")
                 if response.status != 200:
                     raise RuntimeError(f"HTTP {response.status}：{text[:500]}")
-                body = await response.json(content_type=None)
+                body = json.loads(raw)
             return (await self._images_from_openai_body(body, cfg.proxy))[0]
         headers = {"Authorization": f"Bearer {cfg.api_key.strip()}", "Content-Type": "application/json"}
         payload: Dict[str, Any] = {"model": cfg.model.strip(), "prompt": prompt, "n": 1}
@@ -450,7 +464,7 @@ class NekoDraw(MaiBotPlugin):
                 inline = part.get("inlineData") or part.get("inline_data") or {}
                 raw = inline.get("data") if isinstance(inline, dict) else None
                 if isinstance(raw, str) and raw:
-                    images.append(base64.b64decode(raw))
+                    return await asyncio.to_thread(decode_image, raw)
         if not images:
             raise RuntimeError("Gemini 响应里没有图片")
         return images[0]
@@ -493,6 +507,7 @@ class NekoDraw(MaiBotPlugin):
         raise RuntimeError("；".join(errors) or "没有可用的生图接口")
 
     async def _send(self, image: bytes, stream_id: str, prompt: str) -> None:
+        await asyncio.to_thread(validate_image, image)
         encoded = base64.b64encode(image).decode("ascii")
         sent = await self.ctx.send.image(
             encoded,

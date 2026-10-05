@@ -11,7 +11,7 @@ ROOT = pathlib.Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 from source_images import ImageCache, resolve_images, extract
 
-PNG = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=')
+PNG = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC')
 
 
 def message(mid='img'):
@@ -100,6 +100,9 @@ class Providers(unittest.IsolatedAsyncioTestCase):
     async def test_edits_multipart_is_recreated_on_each_attempt(self):
         class Response:
             status = 200
+            @property
+            def content(self): return self
+            async def iter_chunked(self, size): yield b'{}'
             async def __aenter__(self): return self
             async def __aexit__(self, *args): pass
             async def text(self): return '{}'
