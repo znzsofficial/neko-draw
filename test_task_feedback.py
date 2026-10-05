@@ -83,6 +83,8 @@ class TaskFeedback(unittest.IsolatedAsyncioTestCase):
             self.assertIn('不能仅凭 HTTP 400 断言源图 ID 错误', text)
             self.assertIn('不能排除审核拦截', text)
             self.assertIn('不能说已经确认违规', text)
+            self.assertIn('允许主动调整提示词并重新调用一次原工具', text)
+            self.assertIn('只试一次', text)
         specific = self.bot._policy_feedback('', 'HTTP 400：{"error":{"message":"Invalid size: 999x999"}}')
         self.assertIn('Invalid size: 999x999', specific)
         self.assertNotIn('具体原因未知', specific)
