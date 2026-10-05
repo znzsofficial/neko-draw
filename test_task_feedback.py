@@ -45,7 +45,7 @@ class TaskFeedback(unittest.IsolatedAsyncioTestCase):
             text = json.dumps(result, ensure_ascii=False)
             self.assertIn('已失败或取消', text)
             self.assertIn('具体原因未知', text)
-            self.assertNotIn('可能是', text)
+            self.assertIn('不能排除审核拦截', text)
         self.assertIsNone(await self.bot.configure_planner(session_id='chat-b', items=[]))
 
     async def test_send_confirmation_controls_terminal_status(self):
@@ -81,6 +81,8 @@ class TaskFeedback(unittest.IsolatedAsyncioTestCase):
             text = self.bot._policy_feedback('prompt', raw)
             self.assertIn('具体原因未知', text)
             self.assertIn('不能仅凭 HTTP 400 断言源图 ID 错误', text)
+            self.assertIn('不能排除审核拦截', text)
+            self.assertIn('不能说已经确认违规', text)
         specific = self.bot._policy_feedback('', 'HTTP 400：{"error":{"message":"Invalid size: 999x999"}}')
         self.assertIn('Invalid size: 999x999', specific)
         self.assertNotIn('具体原因未知', specific)
