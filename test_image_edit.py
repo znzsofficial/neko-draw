@@ -1,17 +1,18 @@
 import base64
+import asyncio
 import importlib.util
 import io
 import pathlib
 import sys
 import types
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from PIL import Image
 
 ROOT = pathlib.Path(__file__).parent
 sys.path.insert(0, str(ROOT))
-from source_images import ImageCache, resolve_images, extract, emoji_image
+from source_images import ImageCache, resolve_images, extract, normalize_source_image
 
 PNG = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC')
 
@@ -63,6 +64,76 @@ class Sources(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(getattr(image, 'n_frames', 1), 1)
                 self.assertEqual(image.convert('RGB').getpixel((0, 0)), (255, 0, 0))
 
+    def test_gif_delivered_as_image_is_also_normalized(self):
+        m = sticker(animation('GIF'))
+        m['raw_message'][0]['type'] = 'image'
+        result = extract(m)[0]
+        with Image.open(io.BytesIO(result)) as image:
+            self.assertEqual(image.format, 'PNG')
+            self.assertEqual(image.convert('RGB').getpixel((0, 0)), (255, 0, 0))
+
+    def test_apng_default_poster_is_not_first_animation_frame(self):
+        output = io.BytesIO()
+        poster = Image.new('RGBA', (3, 2), 'blue')
+        frame = Image.new('RGBA', (3, 2), 'red')
+        poster.save(output, format='PNG', save_all=True, append_images=[frame], default_image=True)
+        result = extract(sticker(output.getvalue()))[0]
+        with Image.open(io.BytesIO(result)) as image:
+            self.assertEqual(image.convert('RGB').getpixel((0, 0)), (255, 0, 0))
+
+    def test_truncated_jpeg_pixels_rejected_for_image_and_emoji(self):
+        output = io.BytesIO()
+        Image.new('RGB', (32, 32), 'red').save(output, format='JPEG')
+        raw = output.getvalue()
+        scan = raw.index(b'\xff\xda')
+        header_end = scan + 2 + int.from_bytes(raw[scan+2:scan+4], 'big')
+        truncated = raw[:header_end]
+        for kind in ('image', 'emoji'):
+            m = sticker(truncated)
+            m['raw_message'][0]['type'] = kind
+            with self.assertRaises(ValueError):
+                extract(m)
+
+    async def test_cache_is_usable_when_same_message_rpc_fails(self):
+        cache = ImageCache()
+        cache.put('a', sticker())
+        ctx = types.SimpleNamespace(call_capability=AsyncMock(side_effect=RuntimeError('RPC unavailable')))
+        self.assertEqual(await resolve_images(ctx, 'a', 'sticker', cache=cache), [PNG])
+        with self.assertRaises(RuntimeError):
+            await resolve_images(ctx, 'b', 'sticker', cache=cache)
+
+    async def test_fresh_message_bytes_do_not_duplicate_stale_cache_version(self):
+        cache = ImageCache()
+        cache.put('a', sticker())
+        output = io.BytesIO()
+        Image.new('RGB', (2, 2), 'red').save(output, format='JPEG')
+        fresh = output.getvalue()
+        ctx = types.SimpleNamespace(call_capability=AsyncMock(return_value={'message': sticker(fresh)}))
+        self.assertEqual(await resolve_images(ctx, 'a', 'sticker', cache=cache), [fresh])
+
+    async def test_fresh_lookup_wins_over_current_message_old_bytes(self):
+        output = io.BytesIO()
+        Image.new('RGB', (2, 2), 'red').save(output, format='JPEG')
+        fresh = output.getvalue()
+        ctx = types.SimpleNamespace(call_capability=AsyncMock(return_value={'message': sticker(fresh)}))
+        self.assertEqual(await resolve_images(ctx, 'a', current=sticker()), [fresh])
+
+    async def test_cancelled_lookup_is_not_swallowed_by_cache(self):
+        cache = ImageCache()
+        cache.put('a', sticker())
+        ctx = types.SimpleNamespace(call_capability=AsyncMock(side_effect=asyncio.CancelledError()))
+        with self.assertRaises(asyncio.CancelledError):
+            await resolve_images(ctx, 'a', 'sticker', cache=cache)
+
+    async def test_quote_fanout_has_bounded_message_lookups(self):
+        msg = {'message_id': 'root', 'raw_message': [{'type': 'reply', 'data': {'id': f'q-{i}'}} for i in range(17)]}
+        async def fetch(cap, **kw):
+            return {'message': msg if kw['message_id'] == 'root' else sticker(mid=kw['message_id'])}
+        ctx = types.SimpleNamespace(call_capability=AsyncMock(side_effect=fetch))
+        with self.assertRaisesRegex(ValueError, '16'):
+            await resolve_images(ctx, 'chat', 'root')
+        self.assertEqual(ctx.call_capability.call_count, 16)
+
     def test_description_unicode_and_qq_face_are_not_image_bytes(self):
         self.assertEqual(extract({'raw_message': [{'type': 'emoji', 'data': '描述'}, {'type': 'face', 'data': {'id': '123'}}, {'type': 'text', 'data': '😂'}]}), [])
         with self.assertRaises(ValueError):
@@ -70,14 +141,14 @@ class Sources(unittest.IsolatedAsyncioTestCase):
 
     def test_sticker_limits_input_pixels_and_converted_output(self):
         with self.assertRaises(ValueError):
-            emoji_image(b'x' * (10 * 1024 * 1024 + 1))
+            normalize_source_image(b'x' * (10 * 1024 * 1024 + 1))
         with patch('source_images.MAX_PIXELS', 1):
             with self.assertRaises(ValueError):
-                emoji_image(animation('GIF'))
+                normalize_source_image(animation('GIF'))
         data = animation('GIF')
         with patch('source_images.MAX_BYTES', len(data)), patch.object(Image.Image, 'save', side_effect=lambda out, **kw: out.write(b'x' * (len(data) + 1))):
             with self.assertRaises(ValueError):
-                emoji_image(data)
+                normalize_source_image(data)
 
     def test_emoji_four_image_limit(self):
         raw = []
@@ -155,6 +226,22 @@ class Providers(unittest.IsolatedAsyncioTestCase):
         spec.loader.exec_module(mod)
         self.mod = mod
         self.bot = object.__new__(mod.NekoDraw)
+
+    async def test_edit_tool_accepts_gif_sticker_without_generation(self):
+        task = types.SimpleNamespace(summary=lambda: 'submitted')
+        start = Mock(return_value=task)
+        bot = types.SimpleNamespace(
+            config=types.SimpleNamespace(plugin=types.SimpleNamespace(enabled=True)),
+            ctx=types.SimpleNamespace(call_capability=AsyncMock(return_value={'message': sticker(animation('GIF'))})),
+            _stream_id=lambda kw: 'chat', _active_task=lambda stream: None,
+            _image_cache=ImageCache(), _start_task=start, _redact=str)
+        result = await self.mod.NekoDraw.edit_image(bot, prompt='换背景，保留人物', source_message_id='sticker', user_id='user')
+        self.assertTrue(result['success'])
+        args = start.call_args.args
+        self.assertEqual(args[:3], ('chat', '换背景，保留人物', 'user'))
+        with Image.open(io.BytesIO(args[3][0])) as image:
+            self.assertEqual(image.format, 'PNG')
+            self.assertEqual(image.convert('RGB').getpixel((0, 0)), (255, 0, 0))
 
     async def test_chat_keeps_image_bytes(self):
         self.bot._post_json = AsyncMock(return_value={})

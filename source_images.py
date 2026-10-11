@@ -50,35 +50,37 @@ def mime_type(data):
     raise ValueError('源图需要 PNG、JPEG 或 WebP 格式')
 
 
-def emoji_image(data):
-    """Validate actual sticker bytes; animation becomes one static PNG frame.
+def normalize_source_image(data):
+    """Validate image/sticker pixels; animation becomes one static PNG frame.
 
     Never interpret emoji descriptions, Unicode faces or QQ face IDs as images.
-    Only frame zero is decoded; no animation walk or per-frame allocation.
+    Only the first animation frame is decoded (skip APNG's separate poster).
     """
     if not data or len(data) > MAX_BYTES:
-        raise ValueError('单张表情包源图不能为空或超过 10 MiB')
+        raise ValueError('单张源图不能为空或超过 10 MiB')
     try:
         with warnings.catch_warnings():
             warnings.simplefilter('error', Image.DecompressionBombWarning)
             with Image.open(io.BytesIO(data)) as image:
                 if image.format not in {'PNG', 'JPEG', 'WEBP', 'GIF'}:
-                    raise ValueError('表情包源图需要 PNG、JPEG、WebP 或 GIF 格式')
+                    raise ValueError('源图需要 PNG、JPEG、WebP 或 GIF 格式')
                 if image.width * image.height > MAX_PIXELS:
-                    raise ValueError('表情包源图不能超过 4000 万像素')
+                    raise ValueError('源图不能超过 4000 万像素')
                 if image.format == 'GIF' or getattr(image, 'is_animated', False):
-                    image.seek(0)
+                    image.seek(1 if image.format == 'PNG' and image.info.get('default_image') else 0)
                     output = io.BytesIO()
                     image.convert('RGBA').save(output, format='PNG')
                     result = output.getvalue()
                     if len(result) > MAX_BYTES:
-                        raise ValueError('表情包首帧转换后超过 10 MiB')
+                        raise ValueError('动图首帧转换后超过 10 MiB')
                     return result
+                image.load()  # verify() alone does not decode JPEG pixels.
+            with Image.open(io.BytesIO(data)) as image:
                 image.verify()
                 return data
     except (OSError, SyntaxError, EOFError, Image.DecompressionBombError,
             Image.DecompressionBombWarning) as exc:
-        raise ValueError('表情包原始图片无效或无法解码') from exc
+        raise ValueError('原始图片无效或无法解码') from exc
 
 
 def unwrap(value):
@@ -117,10 +119,7 @@ def extract(message):
             data = base64.b64decode(''.join(raw.split()), validate=True)
             if len(data) > MAX_BYTES:
                 raise ValueError('单张源图不能超过 10 MiB')
-            if segment.get('type') == 'emoji':
-                data = emoji_image(data)
-            else:
-                mime_type(data)
+            data = normalize_source_image(data)
             if data not in images:
                 images.append(data)
             if len(images) > MAX_IMAGES:
@@ -130,31 +129,44 @@ def extract(message):
 
 async def resolve_images(ctx, stream_id, message_id='', current=None, cache=None):
     seen = set()
+    own_images = {}
 
     async def lookup(mid, depth=0):
         mid = str(mid or '').strip()
         if not mid or mid in seen or depth > 2:
             return []
+        if len(seen) >= 16:
+            raise ValueError('引用消息过多，一次最多读取 16 条消息')
         seen.add(mid)
         cached = cache.get(stream_id, mid) if cache else []
-        result = await ctx.call_capability('message.get_by_id', chat_id=stream_id,
-                                          message_id=mid, include_binary_data=True)
+        try:
+            result = await ctx.call_capability('message.get_by_id', chat_id=stream_id,
+                                              message_id=mid, include_binary_data=True)
+        except Exception:
+            if cached:
+                return list(cached)  # Only this chat's exact message cache.
+            raise
         messages = unwrap(result)
-        images = list(cached)
-        if messages:
-            for image in await collect(messages[0], depth):
-                if image not in images:
-                    images.append(image)
+        images = await collect(messages[0], depth) if messages else list(cached)
         if len(images) > MAX_IMAGES:
             raise ValueError('一次最多使用 4 张源图')
         return images
 
-    async def collect(message, depth=0):
-        images = await asyncio.to_thread(extract, message)
-        if cache:
-            for image in cache.get(stream_id, str(message.get('message_id') or '')):
-                if image not in images:
-                    images.append(image)
+    async def collect(message, depth=0, authoritative=True):
+        mid = str(message.get('message_id') or '')
+        if not authoritative and mid in own_images:
+            images = list(own_images[mid])
+        else:
+            images = await asyncio.to_thread(extract, message)
+            if images:
+                # Host may have compressed the image since the receive hook.
+                # Prefer fresh bytes rather than supplying two versions.
+                if authoritative and mid:
+                    own_images[mid] = list(images)
+                    if cache:
+                        cache.put(stream_id, message, images=images)
+            elif cache:
+                images = cache.get(stream_id, mid)
         refs = [message.get(k) for k in ('reply_to', 'reply_message_id', 'quote_message_id', 'quoted_message_id')]
         for key in ('reply', 'quote', 'quoted_message'):
             ref = message.get(key)
@@ -170,6 +182,8 @@ async def resolve_images(ctx, stream_id, message_id='', current=None, cache=None
                 for image in await lookup(ref, depth + 1):
                     if image not in images:
                         images.append(image)
+                    if len(images) > MAX_IMAGES:
+                        raise ValueError('一次最多使用 4 张源图')
         if len(images) > MAX_IMAGES:
             raise ValueError('一次最多使用 4 张源图')
         return images
@@ -181,7 +195,7 @@ async def resolve_images(ctx, stream_id, message_id='', current=None, cache=None
         # Restore this message before collecting its quotes. A successful quote
         # must not suppress retrieval of the stripped current image.
         images = await lookup(current.get('message_id'))
-        for image in await collect(current):
+        for image in await collect(current, authoritative=False):
             if image not in images:
                 images.append(image)
     else:
