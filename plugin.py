@@ -17,7 +17,7 @@ import aiohttp
 
 from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParameterInfo, ToolParamType
-from .source_images import ImageCache, mime_type, resolve_images
+from .source_images import ImageCache, extract, mime_type, resolve_images
 from .public_http import PublicClient, download_public, local_addresses
 from .result_images import MAX_IMAGE_BYTES, decode_image, read_response, validate_image
 
@@ -154,14 +154,15 @@ class NekoDraw(MaiBotPlugin):
         self._image_cache = ImageCache()
 
     @HookHandler("chat.receive.before_process", name="neko_source_images",
-                 description="缓存本聊天入站原图供图生图使用", mode=HookMode.OBSERVE)
+                  description="缓存本聊天入站图片/表情包原图供图生图使用", mode=HookMode.OBSERVE)
     async def cache_source_images(self, message: Any = None, stream_id: str = "", **kwargs: Any) -> None:
         if not self.config.plugin.enabled or not isinstance(message, dict):
             return
         stream = str(stream_id or kwargs.get("session_id") or message.get("session_id") or message.get("chat_id") or message.get("stream_id") or "")
         if stream:
             try:
-                self._image_cache.put(stream, message)
+                images = await asyncio.to_thread(extract, message)
+                self._image_cache.put(stream, message, images=images)
             except (ValueError, TypeError):
                 self.ctx.logger.debug("入站图片无法缓存，图生图时可尝试按消息 ID 读取")
 
@@ -827,16 +828,16 @@ class NekoDraw(MaiBotPlugin):
 
     @Tool(
         "neko_edit_image",
-        brief_description="基于聊天里的原图进行图生图或修改图片",
+        brief_description="基于聊天里的图片或表情包原图进行改图",
         detailed_description=(
             "用户要求修改这张图、换背景、换装、重绘、参考原图时调用。"
-            "source_message_id 填当前聊天中含原图或引用原图的真实消息 ID，不能编造。"
+            "source_message_id 填当前聊天中含图片/表情包原图或引用它的真实消息 ID，不能编造。动图仅取首帧作为静态源图，不修改整段动画。"
             "prompt 用自然语言说明修改什么、保留什么。原图作为视觉依据，不需要查记忆重建外貌。"
             "找不到原图就请用户补发，不要改用文生图冒充图生图。"
         ),
         parameters=[
             ToolParameterInfo(name="prompt", param_type=ToolParamType.STRING, description="自然语言的修改要求和保留内容", required=True),
-            ToolParameterInfo(name="source_message_id", param_type=ToolParamType.STRING, description="当前聊天中原图消息或引用消息的真实 ID", required=True),
+            ToolParameterInfo(name="source_message_id", param_type=ToolParamType.STRING, description="当前聊天中图片/表情包消息或引用消息的真实 ID", required=True),
         ],
     )
     async def edit_image(self, prompt: str = "", source_message_id: str = "", **kwargs: Any) -> Dict[str, Any]:

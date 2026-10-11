@@ -1,10 +1,16 @@
 """Resolve real images inside one MaiBot chat; never turn descriptions into inputs."""
 import base64
+import asyncio
+import io
 import time
+import warnings
 from collections import OrderedDict
+
+from PIL import Image
 
 MAX_BYTES = 10 * 1024 * 1024
 MAX_IMAGES = 4
+MAX_PIXELS = 40_000_000
 
 
 class ImageCache:
@@ -21,9 +27,9 @@ class ImageCache:
             _, (_, images) = self.entries.popitem(last=False)
             total -= sum(map(len, images))
 
-    def put(self, stream, message):
+    def put(self, stream, message, images=None):
         mid = str(message.get('message_id') or '')
-        images = extract(message)
+        images = extract(message) if images is None else images
         if mid and images:
             self.entries[(stream, mid)] = (time.monotonic() + 1800, images)
             self.entries.move_to_end((stream, mid))
@@ -42,6 +48,37 @@ def mime_type(data):
     if data.startswith(b'RIFF') and data[8:12] == b'WEBP':
         return 'image/webp'
     raise ValueError('源图需要 PNG、JPEG 或 WebP 格式')
+
+
+def emoji_image(data):
+    """Validate actual sticker bytes; animation becomes one static PNG frame.
+
+    Never interpret emoji descriptions, Unicode faces or QQ face IDs as images.
+    Only frame zero is decoded; no animation walk or per-frame allocation.
+    """
+    if not data or len(data) > MAX_BYTES:
+        raise ValueError('单张表情包源图不能为空或超过 10 MiB')
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(data)) as image:
+                if image.format not in {'PNG', 'JPEG', 'WEBP', 'GIF'}:
+                    raise ValueError('表情包源图需要 PNG、JPEG、WebP 或 GIF 格式')
+                if image.width * image.height > MAX_PIXELS:
+                    raise ValueError('表情包源图不能超过 4000 万像素')
+                if image.format == 'GIF' or getattr(image, 'is_animated', False):
+                    image.seek(0)
+                    output = io.BytesIO()
+                    image.convert('RGBA').save(output, format='PNG')
+                    result = output.getvalue()
+                    if len(result) > MAX_BYTES:
+                        raise ValueError('表情包首帧转换后超过 10 MiB')
+                    return result
+                image.verify()
+                return data
+    except (OSError, SyntaxError, EOFError, Image.DecompressionBombError,
+            Image.DecompressionBombWarning) as exc:
+        raise ValueError('表情包原始图片无效或无法解码') from exc
 
 
 def unwrap(value):
@@ -65,7 +102,7 @@ def segments(message):
 def extract(message):
     images = []
     for segment in segments(message):
-        if segment.get('type') != 'image':
+        if segment.get('type') not in ('image', 'emoji'):
             continue
         for source in (segment, segment.get('data')):
             if not isinstance(source, dict):
@@ -80,7 +117,10 @@ def extract(message):
             data = base64.b64decode(''.join(raw.split()), validate=True)
             if len(data) > MAX_BYTES:
                 raise ValueError('单张源图不能超过 10 MiB')
-            mime_type(data)
+            if segment.get('type') == 'emoji':
+                data = emoji_image(data)
+            else:
+                mime_type(data)
             if data not in images:
                 images.append(data)
             if len(images) > MAX_IMAGES:
@@ -110,7 +150,7 @@ async def resolve_images(ctx, stream_id, message_id='', current=None, cache=None
         return images
 
     async def collect(message, depth=0):
-        images = extract(message)
+        images = await asyncio.to_thread(extract, message)
         if cache:
             for image in cache.get(stream_id, str(message.get('message_id') or '')):
                 if image not in images:
@@ -149,5 +189,5 @@ async def resolve_images(ctx, stream_id, message_id='', current=None, cache=None
     if len(images) > MAX_IMAGES:
         raise ValueError('一次最多使用 4 张源图')
     if not images:
-        raise ValueError('指定消息或引用里没有可读取的原图。请重新发送图片，并引用它使用 /draw edit <修改要求>')
+        raise ValueError('指定消息或引用里没有可读取的图片或表情包原图。请重新发送图片/表情包，并引用它使用 /draw edit <修改要求>')
     return images

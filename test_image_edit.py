@@ -1,15 +1,17 @@
-import asyncio
 import base64
 import importlib.util
+import io
 import pathlib
 import sys
 import types
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
+
+from PIL import Image
 
 ROOT = pathlib.Path(__file__).parent
 sys.path.insert(0, str(ROOT))
-from source_images import ImageCache, resolve_images, extract
+from source_images import ImageCache, resolve_images, extract, emoji_image
 
 PNG = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC')
 
@@ -19,7 +21,73 @@ def message(mid='img'):
         {'type': 'image', 'binary_data_base64': base64.b64encode(PNG).decode()}]}
 
 
+def sticker(data=PNG, mid='sticker'):
+    return {'message_id': mid, 'raw_message': [
+        {'type': 'emoji', 'data': '表情包文字描述不是图像', 'binary_data_base64': base64.b64encode(data).decode()}]}
+
+
+def animation(fmt):
+    output = io.BytesIO()
+    first = Image.new('RGBA', (3, 2), 'red')
+    second = Image.new('RGBA', (3, 2), 'blue')
+    first.save(output, format=fmt, save_all=True, append_images=[second], duration=100, loop=0, lossless=True)
+    return output.getvalue()
+
+
 class Sources(unittest.IsolatedAsyncioTestCase):
+    async def test_emoji_lookup_and_quote_are_chat_bound(self):
+        ctx = types.SimpleNamespace(call_capability=AsyncMock(return_value={'message': sticker()}))
+        images = await resolve_images(ctx, 'chat-a', current={'raw_message': [{'type': 'reply', 'data': {'target_message_id': 'sticker'}}]})
+        self.assertEqual(images, [PNG])
+        self.assertEqual(ctx.call_capability.call_args.kwargs, {'chat_id': 'chat-a', 'message_id': 'sticker', 'include_binary_data': True})
+
+    async def test_emoji_cache_recovers_missing_binary_not_other_chats(self):
+        cache = ImageCache()
+        cache.put('chat-a', sticker())
+        ctx = types.SimpleNamespace(call_capability=AsyncMock(return_value={'message': {'message_id': 'sticker', 'raw_message': [{'type': 'emoji', 'data': 'description'}]}}))
+        self.assertEqual(await resolve_images(ctx, 'chat-a', 'sticker', cache=cache), [PNG])
+        with self.assertRaises(ValueError):
+            await resolve_images(ctx, 'chat-b', 'sticker', cache=cache)
+
+    def test_static_sticker_is_preserved_and_deduplicated_with_image(self):
+        m = message()
+        m['message_segments'] += sticker()['raw_message']
+        self.assertEqual(extract(m), [PNG])
+
+    def test_gif_webp_and_apng_sticker_use_first_static_frame(self):
+        for fmt in ['GIF', 'WEBP', 'PNG']:
+            data = animation(fmt)
+            result = extract(sticker(data))[0]
+            with Image.open(io.BytesIO(result)) as image:
+                self.assertEqual(image.format, 'PNG')
+                self.assertEqual(getattr(image, 'n_frames', 1), 1)
+                self.assertEqual(image.convert('RGB').getpixel((0, 0)), (255, 0, 0))
+
+    def test_description_unicode_and_qq_face_are_not_image_bytes(self):
+        self.assertEqual(extract({'raw_message': [{'type': 'emoji', 'data': '描述'}, {'type': 'face', 'data': {'id': '123'}}, {'type': 'text', 'data': '😂'}]}), [])
+        with self.assertRaises(ValueError):
+            extract(sticker(b'not an image'))
+
+    def test_sticker_limits_input_pixels_and_converted_output(self):
+        with self.assertRaises(ValueError):
+            emoji_image(b'x' * (10 * 1024 * 1024 + 1))
+        with patch('source_images.MAX_PIXELS', 1):
+            with self.assertRaises(ValueError):
+                emoji_image(animation('GIF'))
+        data = animation('GIF')
+        with patch('source_images.MAX_BYTES', len(data)), patch.object(Image.Image, 'save', side_effect=lambda out, **kw: out.write(b'x' * (len(data) + 1))):
+            with self.assertRaises(ValueError):
+                emoji_image(data)
+
+    def test_emoji_four_image_limit(self):
+        raw = []
+        for color in ['red', 'blue', 'green', 'yellow', 'black']:
+            output = io.BytesIO()
+            Image.new('RGB', (2, 2), color).save(output, format='PNG')
+            raw.extend(sticker(output.getvalue())['raw_message'])
+        with self.assertRaises(ValueError):
+            extract({'raw_message': raw})
+
     async def test_quote_and_stream_scope(self):
         ctx = types.SimpleNamespace(call_capability=AsyncMock(return_value={'message': message()}))
         result = await resolve_images(ctx, 'chat-a', current={'message_segments': [{'type': 'reply', 'data': {'id': 'img'}}]})
@@ -60,7 +128,7 @@ class Sources(unittest.IsolatedAsyncioTestCase):
             cache = ImageCache()
             if cached:
                 cache.put('chat', own)
-            async def get(cap, **kw):
+            async def get(cap, cached=cached, **kw):
                 self.assertEqual(kw['chat_id'], 'chat')
                 return {'message': (stripped if cached else own) if kw['message_id'] == 'own' else quoted}
             ctx = types.SimpleNamespace(call_capability=AsyncMock(side_effect=get))
