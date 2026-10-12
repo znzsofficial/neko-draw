@@ -12,7 +12,7 @@ from PIL import Image
 
 ROOT = pathlib.Path(__file__).parent
 sys.path.insert(0, str(ROOT))
-from source_images import ImageCache, resolve_images, extract, normalize_source_image
+from source_images import ImageCache, resolve_images, resolve_edit_images, resolve_context_image, extract, normalize_source_image
 
 PNG = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC')
 
@@ -36,6 +36,91 @@ def animation(fmt):
 
 
 class Sources(unittest.IsolatedAsyncioTestCase):
+    async def test_context_alias_and_tool_media_fallback_stay_in_current_chat(self):
+        for reference in ['a7', 'tool-media-3']:
+            async def fetch(cap, reference=reference, **kw):
+                if cap == 'message.get_by_id':
+                    return None
+                self.assertEqual(cap, 'maisaka.context.resolve_image')
+                self.assertEqual(kw, {'stream_id': 'chat-a', 'source_id': reference, 'index': 0})
+                return {'success': True, 'image': {'binary_data_base64': base64.b64encode(PNG).decode()}}
+            ctx = types.SimpleNamespace(call_capability=AsyncMock(side_effect=fetch))
+            self.assertEqual(await resolve_edit_images(ctx, 'chat-a', reference, current=message('unrelated')), [PNG])
+
+    async def test_explicit_context_index_never_queries_db_or_cache(self):
+        ctx = types.SimpleNamespace(call_capability=AsyncMock(return_value={
+            'success': True, 'image': {'binary_data_base64': base64.b64encode(PNG).decode()}}))
+        cache = ImageCache()
+        cache.put('chat', message('a7'))
+        self.assertEqual(await resolve_edit_images(ctx, 'chat', 'a7', cache=cache, index=2), [PNG])
+        ctx.call_capability.assert_awaited_once_with('maisaka.context.resolve_image', stream_id='chat', source_id='a7', index=2)
+
+    async def test_bad_context_index_fails_without_any_lookup(self):
+        ctx = types.SimpleNamespace(call_capability=AsyncMock())
+        for index in [True, -1, '0', 1.5]:
+            with self.assertRaises(ValueError):
+                await resolve_edit_images(ctx, 'chat', 'img', current=message(), index=index)
+        ctx.call_capability.assert_not_awaited()
+
+    async def test_failed_selected_index_never_substitutes_cached_image(self):
+        ctx = types.SimpleNamespace(call_capability=AsyncMock(return_value={'success': False, 'error': 'out of range'}))
+        cache = ImageCache()
+        cache.put('chat', message('img'))
+        with self.assertRaises(ValueError):
+            await resolve_edit_images(ctx, 'chat', 'img', cache=cache, index=7)
+        self.assertEqual(ctx.call_capability.await_count, 1)
+
+    async def test_legacy_sticker_and_quote_success_do_not_call_context_api(self):
+        ctx = types.SimpleNamespace(call_capability=AsyncMock(return_value={'message': sticker()}))
+        self.assertEqual(await resolve_edit_images(ctx, 'chat', 'sticker'), [PNG])
+        self.assertEqual(ctx.call_capability.await_count, 1)
+        self.assertEqual(ctx.call_capability.call_args.args, ('message.get_by_id',))
+
+    async def test_decode_and_rpc_failures_do_not_trigger_alias_fallback(self):
+        for value in [sticker(b'corrupt')]:
+            ctx = types.SimpleNamespace(call_capability=AsyncMock(return_value={'message': value}))
+            with self.assertRaises(ValueError):
+                await resolve_edit_images(ctx, 'chat', 'img')
+            self.assertEqual(ctx.call_capability.await_count, 1)
+        ctx = types.SimpleNamespace(call_capability=AsyncMock(side_effect=RuntimeError('RPC too big')))
+        with self.assertRaises(RuntimeError):
+            await resolve_edit_images(ctx, 'chat', 'img')
+        self.assertEqual(ctx.call_capability.await_count, 1)
+
+    async def test_context_response_invalid_missing_and_oversized_bytes_rejected(self):
+        for response in [None, {'success': False}, {'success': True},
+                         {'success': True, 'image': {}},
+                         {'success': True, 'image': {'binary_data_base64': 'bad'}},
+                         {'success': True, 'image': {'binary_data_base64': base64.b64encode(b'corrupt').decode()}}]:
+            ctx = types.SimpleNamespace(call_capability=AsyncMock(return_value=response))
+            with self.assertRaises(ValueError):
+                await resolve_context_image(ctx, 'chat', 'media')
+        ctx = types.SimpleNamespace(call_capability=AsyncMock(return_value={
+            'success': True, 'image': {'binary_data_base64': base64.b64encode(PNG).decode()}}))
+        with patch('source_images.MAX_BYTES', 10):
+            with self.assertRaises(ValueError):
+                await resolve_context_image(ctx, 'chat', 'media')
+        with patch('source_images.MAX_PIXELS', 0):
+            with self.assertRaises(ValueError):
+                await resolve_context_image(ctx, 'chat', 'media')
+
+    async def test_context_gif_is_normalized_and_cancellation_propagates(self):
+        ctx = types.SimpleNamespace(call_capability=AsyncMock(return_value={
+            'success': True, 'image': {'binary_data_base64': base64.b64encode(animation('GIF')).decode()}}))
+        images = await resolve_context_image(ctx, 'chat', 'media')
+        with Image.open(io.BytesIO(images[0])) as image:
+            self.assertEqual(image.format, 'PNG')
+            self.assertEqual(image.convert('RGB').getpixel((0, 0)), (255, 0, 0))
+        ctx.call_capability.side_effect = asyncio.CancelledError()
+        with self.assertRaises(asyncio.CancelledError):
+            await resolve_context_image(ctx, 'chat', 'media')
+
+    async def test_command_missing_source_does_not_guess_context_image(self):
+        ctx = types.SimpleNamespace(call_capability=AsyncMock(return_value=None))
+        with self.assertRaises(ValueError):
+            await resolve_edit_images(ctx, 'chat', current={'message_id': 'text-only'})
+        self.assertTrue(all(call.args == ('message.get_by_id',) for call in ctx.call_capability.call_args_list))
+
     async def test_emoji_lookup_and_quote_are_chat_bound(self):
         ctx = types.SimpleNamespace(call_capability=AsyncMock(return_value={'message': sticker()}))
         images = await resolve_images(ctx, 'chat-a', current={'raw_message': [{'type': 'reply', 'data': {'target_message_id': 'sticker'}}]})
@@ -242,6 +327,17 @@ class Providers(unittest.IsolatedAsyncioTestCase):
         with Image.open(io.BytesIO(args[3][0])) as image:
             self.assertEqual(image.format, 'PNG')
             self.assertEqual(image.convert('RGB').getpixel((0, 0)), (255, 0, 0))
+
+    async def test_edit_tool_submits_selected_context_image_without_generation(self):
+        start = Mock(return_value=types.SimpleNamespace(summary=lambda: 'submitted'))
+        cap = AsyncMock(return_value={'success': True, 'image': {'binary_data_base64': base64.b64encode(PNG).decode()}})
+        bot = types.SimpleNamespace(config=types.SimpleNamespace(plugin=types.SimpleNamespace(enabled=True)),
+                                    ctx=types.SimpleNamespace(call_capability=cap), _stream_id=lambda kw: 'chat',
+                                    _active_task=lambda stream: None, _image_cache=ImageCache(), _start_task=start, _redact=str)
+        result = await self.mod.NekoDraw.edit_image(bot, prompt='换背景', source_message_id='tool-media-2', source_image_index=1)
+        self.assertTrue(result['success'])
+        self.assertEqual(start.call_args.args[3], [PNG])
+        cap.assert_awaited_once_with('maisaka.context.resolve_image', stream_id='chat', source_id='tool-media-2', index=1)
 
     async def test_chat_keeps_image_bytes(self):
         self.bot._post_json = AsyncMock(return_value={})

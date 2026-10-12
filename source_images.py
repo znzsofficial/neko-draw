@@ -13,6 +13,45 @@ MAX_IMAGES = 4
 MAX_PIXELS = 40_000_000
 
 
+class MissingSourceImages(ValueError):
+    """A valid lookup has no readable source; not a decode/limit failure."""
+
+
+async def resolve_context_image(ctx, stream_id, source_id, index=0):
+    """One explicitly selected context image; never substitute another index."""
+    if not stream_id or not isinstance(source_id, str) or not source_id.strip():
+        raise ValueError('上下文取图需要当前聊天和真实图片来源编号')
+    if type(index) is not int or index < 0:
+        raise ValueError('source_image_index 必须是非负整数，从 0 开始')
+    result = await ctx.call_capability('maisaka.context.resolve_image',
+                                       stream_id=stream_id, source_id=source_id.strip(), index=index)
+    if not isinstance(result, dict) or result.get('success') is not True:
+        raise ValueError('上下文图片不可读取，请补发或改用真实消息 ID')
+    image = result.get('image')
+    if not isinstance(image, dict):
+        raise ValueError('宿主未返回上下文图片字节')
+    # Reuse the same bounded Base64, pixel, format and animation validation.
+    images = await asyncio.to_thread(extract, {'message_segments': [dict(image, type='image')]})
+    if len(images) != 1:
+        raise ValueError('宿主未返回一张可读取的上下文图片')
+    return images
+
+
+async def resolve_edit_images(ctx, stream_id, source_id='', current=None, cache=None, index=None):
+    if index is not None:
+        # Explicit selection is authoritative: an invalid index must not turn
+        # into all images / another cached picture / a quote fallback.
+        return await resolve_context_image(ctx, stream_id, source_id, index)
+    try:
+        return await resolve_images(ctx, stream_id, source_id, current, cache)
+    except MissingSourceImages:
+        if not source_id:
+            raise  # Commands preserve their current-message/quote semantics.
+        # Short aliases and tool media IDs do not necessarily exist in the DB.
+        # Preserve legacy all-image/sticker/quote behaviour when it succeeds.
+        return await resolve_context_image(ctx, stream_id, source_id)
+
+
 class ImageCache:
     def __init__(self):
         self.entries = OrderedDict()
@@ -203,5 +242,5 @@ async def resolve_images(ctx, stream_id, message_id='', current=None, cache=None
     if len(images) > MAX_IMAGES:
         raise ValueError('一次最多使用 4 张源图')
     if not images:
-        raise ValueError('指定消息或引用里没有可读取的图片或表情包原图。请重新发送图片/表情包，并引用它使用 /draw edit <修改要求>')
+        raise MissingSourceImages('指定消息或引用里没有可读取的图片或表情包原图。请重新发送图片/表情包，并引用它使用 /draw edit <修改要求>')
     return images

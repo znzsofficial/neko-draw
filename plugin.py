@@ -17,7 +17,7 @@ import aiohttp
 
 from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParameterInfo, ToolParamType
-from .source_images import ImageCache, extract, mime_type, resolve_images
+from .source_images import ImageCache, extract, mime_type, resolve_edit_images
 from .public_http import PublicClient, download_public, local_addresses
 from .result_images import MAX_IMAGE_BYTES, decode_image, read_response, validate_image
 
@@ -831,23 +831,25 @@ class NekoDraw(MaiBotPlugin):
         brief_description="基于聊天里的图片或表情包原图进行改图",
         detailed_description=(
             "用户要求修改这张图、换背景、换装、重绘、参考原图时调用。"
-            "source_message_id 填当前聊天中含图片/表情包原图或引用它的真实消息 ID，不能编造。动图仅取首帧作为静态源图，不修改整段动画。"
+            "source_message_id 填当前聊天中图片/表情包或引用消息的真实 ID，也支持上下文短消息编号及工具媒体索引，不能编造。"
+            "普通消息不填source_image_index时保留多图/引用；只想修改某张普通图片时填从0开始的source_image_index。上下文短编号/工具媒体索引默认取第0张，索引不用于emoji表情包。动图只取首帧，不修改整段动画。"
             "prompt 用自然语言说明修改什么、保留什么。原图作为视觉依据，不需要查记忆重建外貌。"
             "找不到原图就请用户补发，不要改用文生图冒充图生图。"
         ),
         parameters=[
             ToolParameterInfo(name="prompt", param_type=ToolParamType.STRING, description="自然语言的修改要求和保留内容", required=True),
-            ToolParameterInfo(name="source_message_id", param_type=ToolParamType.STRING, description="当前聊天中图片/表情包消息或引用消息的真实 ID", required=True),
+            ToolParameterInfo(name="source_message_id", param_type=ToolParamType.STRING, description="当前聊天中的真实消息ID、短消息编号或工具媒体索引", required=True),
+            ToolParameterInfo(name="source_image_index", param_type=ToolParamType.INTEGER, description="可选，指定普通图片在源消息中的索引，从0开始；不用于emoji表情包", required=False),
         ],
     )
-    async def edit_image(self, prompt: str = "", source_message_id: str = "", **kwargs: Any) -> Dict[str, Any]:
+    async def edit_image(self, prompt: str = "", source_message_id: str = "", source_image_index: int | None = None, **kwargs: Any) -> Dict[str, Any]:
         stream_id = self._stream_id(kwargs)
         if not self.config.plugin.enabled or not stream_id or not prompt.strip():
             return {"success": False, "content": "插件未启用、聊天缺失或修改要求为空"}
         if self._active_task(stream_id):
             return {"success": False, "content": "上一张还没画完。\n" + self._status_text(stream_id)}
         try:
-            images = await resolve_images(self.ctx, stream_id, source_message_id.strip(), kwargs.get("message"), self._image_cache)
+            images = await resolve_edit_images(self.ctx, stream_id, source_message_id.strip(), kwargs.get("message"), self._image_cache, index=source_image_index)
         except Exception as exc:
             return {"success": False, "content": "无法取得原图：" + self._redact(str(exc))[:300]}
         if self._active_task(stream_id):
