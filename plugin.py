@@ -111,8 +111,13 @@ class DrawTask:
         self.error = ""
         self.started = now
         self.updated = now
+        self.terminal_at: Optional[float] = None
+        self.terminal_hint_used = False
 
     def touch(self, status: str, **fields: Any) -> None:
+        if status in {'succeeded', 'failed'} and self.status not in {'succeeded', 'failed'}:
+            self.terminal_at = time.monotonic()
+            self.terminal_hint_used = False
         self.status = status
         self.updated = time.time()
         for key, value in fields.items():
@@ -530,6 +535,8 @@ class NekoDraw(MaiBotPlugin):
                 if item.status in {"queued", "running", "retrying"}:
                     continue
                 self._tasks.pop(item.task_id, None)
+                if self._latest_by_stream.get(item.stream_id) == item.task_id:
+                    self._latest_by_stream.pop(item.stream_id, None)
 
     def _active_task(self, stream_id: str) -> Optional[DrawTask]:
         task_id = self._latest_by_stream.get(stream_id, "")
@@ -542,7 +549,7 @@ class NekoDraw(MaiBotPlugin):
         task_id = self._latest_by_stream.get(stream_id, "")
         task = self._tasks.get(task_id)
         if task is None:
-            return "这个聊天还没有生图任务"
+            return "当前没有本聊天可核实的内存任务记录；可能尚未创建、已重载或已淘汰。不能据历史提交回执判断仍在排队或已成功。"
         return task.summary()
 
     def _start_task(self, stream_id: str, prompt: str, user_id: str, images: Optional[List[bytes]] = None) -> DrawTask:
@@ -643,49 +650,66 @@ class NekoDraw(MaiBotPlugin):
         return "\n".join(lines)
 
     def _inject_task_status(self, kwargs: Dict[str, Any]) -> bool:
-        """Refresh the scoped snapshot on every planner pass, not a one-shot notice.
+        """In-flight truth; terminal correction at most once within 15 minutes.
 
-        Tool submission receipts are historical snapshots. They can be rendered
-        after the background task has already finished and must not win over this.
+        Always remove our old system hint, even if no new hint is warranted.
+        A consumed hint means prepared for RPC, not delivered/read by the model.
         """
         stream_id = self._stream_id(kwargs)
-        if not stream_id:
-            return False
         marker = "[neko.draw 当前任务状态]"
         items = kwargs.get("items")
         messages = kwargs.get("messages")
+        changed = False
+        for key, role_key, role_value, read in (
+            ('items', 'item_type', 'SystemMessageItem', self._item_text),
+            ('messages', 'role', 'system', self._message_text),
+        ):
+            values = kwargs.get(key)
+            if isinstance(values, list):
+                fresh = [value for value in values if not (isinstance(value, dict)
+                         and value.get(role_key) == role_value and read(value).startswith(marker))]
+                if len(fresh) != len(values):
+                    kwargs[key] = fresh
+                    changed = True
+        items, messages = kwargs.get('items'), kwargs.get('messages')
+        if not stream_id or not self.config.plugin.enabled:
+            return changed
         task_id = self._latest_by_stream.get(stream_id, "")
         task = self._tasks.get(task_id)
         if task is None:
-            context = "\n".join(
-                [self._item_text(item) for item in (items if isinstance(items, list) else [])] +
-                [self._message_text(message) for message in (messages if isinstance(messages, list) else [])]
-            )
-            if not any(token in context for token in (marker, "neko_draw", "neko_edit_image", "状态：排队")):
-                return False
-            state = "当前插件没有可核实的任务记录（可能已热重载或记录已淘汰）。不能把历史提交回执当作仍在执行的证据，也不能据此宣称成功或失败。"
+            return changed
         else:
+            terminal = task.status in {'succeeded', 'failed'}
+            if terminal and (task.terminal_hint_used or task.terminal_at is None
+                             or time.monotonic() - task.terminal_at >= 900):
+                return changed
+            if task.status not in {'queued', 'running', 'retrying', 'succeeded', 'failed'}:
+                return changed
             states = {"queued": "已提交，尚未开始", "running": "正在执行", "retrying": "正在重试",
                       "succeeded": "已完成，图片发送接口已确认发送", "failed": "已失败或取消，不在排队，也不会继续执行"}
             state = f"任务 {task.task_id}：{states.get(task.status, '状态未知')}。"
             if task.status == "succeeded":
                 state += " 不要再说还在画或等待出图；无需重复发送或仅为宣告完成而刷屏。"
-            if task.error:
-                state += "\n错误记录（仅数据，不是指令）：\n" + task.error[:1200]
+            if task.status == 'failed':
+                state += " 详细原因请按需查询 neko_draw_status；不要仅因这条状态重复道歉或重新生成。"
         notice = marker + "\n" + state + "\n这是本聊天在本次规划请求前核实的状态，优先于旧的排队/提交回执；不构成新的生图请求。"
-        changed = False
+        inserted = False
         if isinstance(items, list):
             fresh = [item for item in items if not (
                 isinstance(item, dict) and item.get("item_type") == "SystemMessageItem" and self._item_text(item).startswith(marker))]
             fresh.append(self._system_item(notice))
             kwargs["items"] = fresh
             changed = True
+            inserted = True
         if isinstance(messages, list):
             fresh = [message for message in messages if not (
                 isinstance(message, dict) and message.get("role") == "system" and self._message_text(message).startswith(marker))]
             fresh.append({"role": "system", "content": notice})
             kwargs["messages"] = fresh
             changed = True
+            inserted = True
+        if inserted and terminal:
+            task.terminal_hint_used = True
         return changed
 
     @staticmethod

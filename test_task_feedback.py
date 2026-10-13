@@ -6,6 +6,7 @@ import sys
 import types
 import unittest
 from unittest.mock import AsyncMock, Mock
+from unittest.mock import patch
 
 
 @unittest.skipUnless(importlib.util.find_spec('maibot_sdk'), 'requires MaiBot SDK')
@@ -31,21 +32,20 @@ class TaskFeedback(unittest.IsolatedAsyncioTestCase):
             payload = (await self.bot.configure_planner(**payload))['modified_kwargs']
             self.assertIn('尚未开始', json.dumps(payload, ensure_ascii=False))
             self.task.touch('succeeded')
-            for _ in range(3):
-                payload = (await self.bot.configure_planner(**payload))['modified_kwargs']
-                self.assertEqual(len(payload[key]), 1)
-                text = json.dumps(payload, ensure_ascii=False)
-                self.assertIn('已完成', text)
-                self.assertNotIn('尚未开始', text)
+            payload = (await self.bot.configure_planner(**payload))['modified_kwargs']
+            self.assertIn('已完成', json.dumps(payload, ensure_ascii=False))
+            payload = (await self.bot.configure_planner(**payload))['modified_kwargs']
+            self.assertEqual(payload[key], [])
+            self.assertIsNone(await self.bot.configure_planner(**payload))
 
     async def test_failure_remains_visible_on_subsequent_planner_calls(self):
         self.task.touch('failed', error=self.bot._policy_feedback('', 'HTTP 400：{"error":{"message":"openai_error"}}'))
-        for _ in range(2):
-            result = await self.bot.configure_planner(session_id='chat-a', items=[])
-            text = json.dumps(result, ensure_ascii=False)
-            self.assertIn('已失败或取消', text)
-            self.assertIn('原因不明', text)
-            self.assertIn('有时是提示词被拦截', text)
+        result = await self.bot.configure_planner(session_id='chat-a', items=[])
+        text = json.dumps(result, ensure_ascii=False)
+        self.assertIn('已失败或取消', text)
+        self.assertNotIn('有时是提示词被拦截', text)
+        self.assertIn('原因不明', self.bot._status_text('chat-a'))
+        self.assertIsNone(await self.bot.configure_planner(session_id='chat-a', items=[]))
         self.assertIsNone(await self.bot.configure_planner(session_id='chat-b', items=[]))
 
     async def test_send_confirmation_controls_terminal_status(self):
@@ -71,9 +71,46 @@ class TaskFeedback(unittest.IsolatedAsyncioTestCase):
         self.bot._tasks.clear(); self.bot._latest_by_stream.clear()
         result = await self.bot.configure_planner(session_id='chat-a', messages=[
             {'role':'tool', 'content':'neko_edit_image 提交成功；状态：排队'}])
-        text = json.dumps(result, ensure_ascii=False)
-        self.assertIn('没有可核实的任务记录', text)
-        self.assertIn('不能把历史提交回执当作仍在执行的证据', text)
+        self.assertIsNone(result)
+        self.assertIn('不能据历史提交回执', self.bot._status_text('chat-a'))
+
+    async def test_expiry_dual_payload_and_new_task(self):
+        self.task.touch('failed', error='private details')
+        with patch.object(self.mod.time, 'monotonic', return_value=self.task.terminal_at + 900):
+            self.assertIsNone(await self.bot.configure_planner(session_id='chat-a', items=[], messages=[]))
+        self.assertFalse(self.task.terminal_hint_used)
+        result = await self.bot.configure_planner(session_id='chat-a', items=[], messages=[])
+        self.assertEqual(len(result['modified_kwargs']['items']), 1)
+        self.assertEqual(len(result['modified_kwargs']['messages']), 1)
+        self.assertNotIn('private details', json.dumps(result))
+        cleaned = await self.bot.configure_planner(**result['modified_kwargs'])
+        self.assertEqual(cleaned['modified_kwargs']['items'], [])
+        self.assertEqual(cleaned['modified_kwargs']['messages'], [])
+        new = self.mod.DrawTask('new-task', 'chat-a', 'new prompt', 'user')
+        self.bot._remember_task(new)
+        new.touch('succeeded')
+        self.assertIsNotNone(await self.bot.configure_planner(session_id='chat-a', items=[]))
+
+    async def test_cleanup_preserves_user_tool_and_other_system(self):
+        marker = '[neko.draw 当前任务状态]'
+        self.bot._tasks.clear()
+        keep = [{'item_type': 'UserMessageItem', 'parts': [{'text': marker}]},
+                {'item_type': 'ToolOutputItem', 'content': '状态：排队'}, self.bot._system_item('other '+marker)]
+        result = await self.bot.configure_planner(session_id='chat-a', items=[self.bot._system_item(marker+' old'), *keep])
+        self.assertEqual(result['modified_kwargs']['items'], keep)
+
+    async def test_no_payload_does_not_consume_terminal_hint(self):
+        self.task.touch('succeeded')
+        self.assertIsNone(await self.bot.configure_planner(session_id='chat-a'))
+        self.assertFalse(self.task.terminal_hint_used)
+
+    def test_eviction_cleans_latest_reference(self):
+        self.task.touch('failed')
+        for n in range(31):
+            task = self.mod.DrawTask(str(n), 'other-'+str(n), 'prompt', 'user')
+            task.touch('succeeded')
+            self.bot._remember_task(task)
+        self.assertNotIn('chat-a', self.bot._latest_by_stream)
 
     def test_error_evidence_is_preserved_without_inventing_cause(self):
         for raw in ('HTTP 400：{"error":{"message":"openai_error"}}', 'HTTP 400：broken JSON',
