@@ -587,7 +587,7 @@ class NekoDraw(MaiBotPlugin):
     @HookHandler(
         "maisaka.planner.before_request",
         name="neko_draw_planner",
-        description="画图时用自然语言写画面，不要堆标签",
+        description="生图路由与自画像记忆提示",
         mode=HookMode.BLOCKING,
         order=HookOrder.LATE,
         error_policy=ErrorPolicy.SKIP,
@@ -779,50 +779,24 @@ class NekoDraw(MaiBotPlugin):
     def _planner_instruction() -> str:
         return (
             "仅当当前用户确实要求生成图片时，以下生图说明才适用；历史提及、闲聊和取消请求不构成生图任务。"
-            "有原图的修改、重绘、换装、换背景请调用 neko_edit_image，传入原图消息 ID，以原图为依据，不用查记忆重建外貌。"
-            "以下仅针对无原图的文生图：如果画的是你自己、你的样子或自画像，先调用 query_memory，查询长期记忆里的外貌，包括发色、发型、五官、衣服和配饰。"
-            "把查到的具体样子写成一段完整的话，再调用 neko_draw。不要编造记忆里没有的外貌，也不要只看人格设定。"
-            "画别人，或用户已经把画面说清楚时，按当前对话写，不必为了画画去查记忆。"
-            "prompt 写成能看懂的画面描述。不要使用 masterpiece、1girl、solo 这类标签；中文里用逗号分开外貌和镜头是可以的。"
+            "有原图的修改或重绘使用 neko_edit_image，以原图为依据。"
+            "无原图的自画像先调用 query_memory 查询长期记忆中的外貌，再将查到的相关特征用于 neko_draw；未知特征不当作已有记忆，用户要求的新造型作为本次创作设定。"
+            "其他文生图按用户要求调用 neko_draw。自然语言、标签或混合描述均可，不要求固定句式或列全画面要素。"
         )
-
-    @staticmethod
-    def _tag_prompt_feedback() -> str:
-        return (
-            "提示词是一串逗号短词，不能拿去生图。请改成一段完整的话。"
-            "如果画的是你自己，先调用 query_memory 查询长期记忆里的外貌，再把查到的发色、发型、五官和衣服写进句子，然后重新调用 neko_draw。"
-        )
-
-    @staticmethod
-    def _is_tag_prompt(text: str) -> bool:
-        lowered = text.lower()
-        if any(marker in lowered for marker in ("masterpiece", "best quality", "1girl", "1boy", "solo", "highres")):
-            return True
-        normalized = text.replace("，", ",").replace("、", ",")
-        parts = [part.strip(" 。.!?！？") for part in normalized.split(",") if part.strip(" 。.!?！？")]
-        if len(parts) < 8:
-            return False
-        # 中文描述常常用逗号切开，但句子里会有「的 / 着 / 了」，或者某一截已经是短语。
-        cjk = sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
-        if cjk >= 8 and any(len(part) >= 8 or any(mark in part for mark in ("的", "着", "了")) for part in parts):
-            return False
-        if any(len(part) >= 24 for part in parts):
-            return False
-        return sum(len(part) for part in parts) / len(parts) < 8
 
     @Tool(
         "neko_draw",
         brief_description="根据已经写好的画面描述生成一张图片",
         detailed_description=(
-            "仅用于无原图的文生图。有原图的修改或重绘使用 neko_edit_image。画你自己或自画像时，先调用 query_memory 查询长期记忆里的外貌，再把查到的样子写进 prompt。"
-            "prompt 写明发色、发型、五官、衣服、动作和场景。不要编造记忆里没有的外貌。"
-            "不要使用 masterpiece、1girl、solo。中文描述可以用逗号分隔，不要只堆没有语法的标签。"
+            "无原图的文生图；修改已有图片使用 neko_edit_image。"
+            "自画像先调用 query_memory 查长期记忆中的外貌，以查到的特征为基础，用户要求的新造型作为本次创作设定，不冒称已有记忆。"
+            "描述所需主体、效果或风格即可，推荐清楚的自然语言，也接受标签、逗号短语及混合表达，无需列全外貌/场景要素。"
         ),
         parameters=[
             ToolParameterInfo(
                 name="prompt",
                 param_type=ToolParamType.STRING,
-                description="画面描述。画自己时先查长期记忆，再写入查到的具体外貌。不要堆 masterpiece、1girl 这类标签",
+                description="所需画面或风格，自然语言、标签或混合描述均可",
                 required=True,
             ),
         ],
@@ -834,11 +808,6 @@ class NekoDraw(MaiBotPlugin):
             return {"success": False, "content": "生图插件未启用"}
         if not text:
             return {"success": False, "content": "提示词是空的"}
-        if self._is_tag_prompt(text):
-            return {
-                "success": False,
-                "content": self._tag_prompt_feedback(),
-            }
         if not stream_id:
             return {"success": False, "content": "找不到当前聊天"}
         active = self._active_task(stream_id)
@@ -924,8 +893,6 @@ class NekoDraw(MaiBotPlugin):
                 return False, "请引用原图，发送 /draw edit <修改要求>", True
             result = await self.edit_image(prompt=parts[1], stream_id=stream_id, user_id=sender, **kwargs)
             return bool(result["success"]), str(result["content"]), True
-        if self._is_tag_prompt(payload):
-            return False, self._tag_prompt_feedback(), True
         active = self._active_task(stream_id)
         if active is not None:
             return False, "上一张还没画完。\n" + active.summary(), True
