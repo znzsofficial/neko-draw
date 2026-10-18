@@ -37,3 +37,7 @@ aspect_ratio = "1:1"
 # native：Gemini generateContent。openai：把上面的地址当 OpenAI 兼容网关。
 mode = "native"
 proxy = "http://127.0.0.1:7890"
+[life]
+# 独立授权的生活环境插画，需配对Life能力密钥；不影响普通生图。
+enabled = false
+sessions = []

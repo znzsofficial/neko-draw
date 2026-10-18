@@ -15,11 +15,12 @@ from urllib.parse import urlsplit
 
 import aiohttp
 
-from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
+from maibot_sdk import API, Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParameterInfo, ToolParamType
 from .source_images import ImageCache, extract, mime_type, resolve_edit_images
 from .public_http import PublicClient, download_public, local_addresses
 from .result_images import MAX_IMAGE_BYTES, decode_image, read_response, validate_image
+from .life_authorization import authenticate as authenticate_life, consume as consume_life
 
 
 MARKDOWN_IMAGE = re.compile(r"!\[[^\]]*]\(([^)\s]+)\)")
@@ -86,12 +87,18 @@ class GeminiConfig(PluginConfigBase):
     proxy: str = Field(default="http://127.0.0.1:7890", description="访问 Google 用的代理")
 
 
+class LifeConfig(PluginConfigBase):
+    enabled: bool = Field(default=False, description="允许已配对Life服务自主配图，独立于普通生图工具")
+    sessions: List[str] = Field(default_factory=list, description="允许Life配图的宿主会话ID；空列表拒绝")
+
+
 class PluginConfig(PluginConfigBase):
     plugin: PluginSection = Field(default_factory=PluginSection)
     general: GeneralConfig = Field(default_factory=GeneralConfig)
     command: CommandConfig = Field(default_factory=CommandConfig)
     openai: OpenAIConfig = Field(default_factory=OpenAIConfig)
     gemini: GeminiConfig = Field(default_factory=GeminiConfig)
+    life: LifeConfig = Field(default_factory=LifeConfig)
 
 
 class DrawTask:
@@ -157,6 +164,8 @@ class NekoDraw(MaiBotPlugin):
         self._preferred_openai_mode = ""
         self._preferred_openai_edit_mode = ""
         self._image_cache = ImageCache()
+        self._life_lock = asyncio.Lock()
+        self._life_closed = False
 
     @HookHandler("chat.receive.before_process", name="neko_source_images",
                   description="缓存本聊天入站图片/表情包原图供图生图使用", mode=HookMode.OBSERVE)
@@ -172,6 +181,7 @@ class NekoDraw(MaiBotPlugin):
                 self.ctx.logger.debug("入站图片无法缓存，图生图时可尝试按消息 ID 读取")
 
     async def on_load(self) -> None:
+        self._life_closed = False
         if not self.config.plugin.enabled:
             self.ctx.logger.info("生图插件已禁用")
             return
@@ -182,6 +192,7 @@ class NekoDraw(MaiBotPlugin):
         )
 
     async def on_unload(self) -> None:
+        self._life_closed = True
         runners = list(self._runners.values())
         for runner in runners:
             runner.cancel()
@@ -203,6 +214,7 @@ class NekoDraw(MaiBotPlugin):
         self._preferred_openai_mode = ""
         self._preferred_openai_edit_mode = ""
         self.ctx.logger.info("生图配置已热重载：version=%s", version)
+        self._life_closed = False
 
     async def _http(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -551,6 +563,34 @@ class NekoDraw(MaiBotPlugin):
         if task is None:
             return "当前没有本聊天可核实的内存任务记录；可能尚未创建、已重载或已淘汰。不能据历史提交回执判断仍在排队或已成功。"
         return task.summary()
+
+    @API('life_v1', version='1', public=True, description='签名Life配图任务，只接收独立授权且配对的会话')
+    async def life_v1(self, packet=None, **kwargs):
+        del kwargs
+        async with self._life_lock:
+            if self._life_closed or not self.config.plugin.enabled or not self.config.life.enabled:
+                return {'success': False, 'status': 'disabled'}
+            try:
+                body, nonce = authenticate_life(packet, self.ctx.paths.data_dir)
+                session = body['session_id']
+                if session not in self.config.life.sessions:
+                    return {'success': False, 'status': 'session_denied'}
+                fresh = await asyncio.to_thread(consume_life, self.ctx.paths.data_dir, body, nonce)
+                task_id = body['request_id']
+                if not fresh:
+                    task = self._tasks.get(task_id)
+                    return {'success': True, 'status': task.status if task else 'unknown', 'task_id': task_id}
+                if self._life_closed or not self.config.plugin.enabled or not self.config.life.enabled or session not in self.config.life.sessions:
+                    return {'success': False, 'status': 'cancelled'}
+                if self._active_task(session):
+                    return {'success': False, 'status': 'busy'}
+                task = DrawTask(task_id, session, body['prompt'], 'neko.life')
+                task.max_attempts = self.config.general.retry_times + 1
+                self._remember_task(task)
+                self._runners[task_id] = asyncio.create_task(self._run_task(task))
+                return {'success': True, 'status': 'submitted', 'task_id': task_id}
+            except Exception:
+                return {'success': False, 'status': 'admission_rejected'}
 
     def _start_task(self, stream_id: str, prompt: str, user_id: str, images: Optional[List[bytes]] = None) -> DrawTask:
         active = self._active_task(stream_id)
