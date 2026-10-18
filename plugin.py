@@ -721,7 +721,7 @@ class NekoDraw(MaiBotPlugin):
         else:
             terminal = task.status in {'succeeded', 'failed'}
             if terminal and (task.terminal_hint_used or task.terminal_at is None
-                             or time.monotonic() - task.terminal_at >= 900):
+                             or time.monotonic() >= task.terminal_at + 900):
                 return changed
             if task.status not in {'queued', 'running', 'retrying', 'succeeded', 'failed'}:
                 return changed
