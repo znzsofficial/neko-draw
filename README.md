@@ -69,3 +69,26 @@ MaiBot 1.3.6+，插件 SDK 2.12+。许可证是 MIT。
 无新增每日生图成本限额，Life另保留同场景去重及可配置防刷屏冷却；submitted不是QQ客户端送达证明。
 与Life0.4的签名执行、重载防重放及真实供应商生图已验证（私有图片捕获，无额外QQ发送）；
 Linux/Windows×Python3.12/3.14完整59项回归通过。提醒终态边界改用绝对deadline比较，避免浮点相减的平台精度偏差。
+
+## CI、离线回归与源码包
+
+GitHub Actions 在 Ubuntu/Windows × Python 3.12/3.14 × SDK `==2.12.0`/`>=2.12,<3` 共8档运行。
+SDK 的 PyPI 包名是 `maibot-plugin-sdk`，导入名为 `maibot_sdk`；必须安装真实 SDK，不以 stub 替代。
+
+```sh
+python -m pip install 'maibot-plugin-sdk==2.12.0' 'aiohttp>=3.12' 'httpx>=0.26' 'Pillow>=10' tzdata
+python scripts/check.py
+python scripts/package.py
+# 可选：输出到尚不存在的路径，不创建 GitHub Release
+python scripts/package.py --output neko-draw.zip
+```
+
+门禁要求至少71项测试、0 skip、0失败，防止缺SDK后关键用例被跳过或发现0项仍成功。
+`tzdata` 显式安装，避免Windows与Linux时区数据库差异。新增公网下载回归全部使用MockTransport/假会话：
+混合公网/内网DNS、空解析、IPv4映射、当前机器地址、逐跳验证、DNS重绑定、重定向上限、固定IP及Host/TLS SNI、
+代理传输参数、分块响应限额；不访问测试域名/真实供应商、不付费生成、不发送QQ。共享`public_http.py`未修改。
+
+打包只读取`scripts/package.py`列出的9个固定文件（源码、manifest、MIT许可证、README及公开`config.example.toml`）；
+拒绝符号链接，不递归扫描。实际`config.toml`、`.env`、能力密钥、数据库、回执、缓存、音频/图片和其他运行数据不进入ZIP。
+测试检查私密哨兵不入包/多余归档成员拒绝；CI仅在临时目录解压并用真实SDK导入、构造插件，不启用/加载宿主服务。
+默认包随临时目录删除，不上传artifact、不创建Release、不部署；仅显式`--output`保留本地ZIP。
