@@ -22,7 +22,7 @@ from .public_http import PublicClient, download_public, local_addresses
 from .result_images import MAX_IMAGE_BYTES, decode_image, read_response, validate_image
 from .life_authorization import authenticate as authenticate_life, consume as consume_life
 from .life_authorization import target_allowed as life_target_allowed, target_policy as life_target_policy
-from .self_reference import read_reference, portrait_prompt
+from .self_reference import read_reference, portrait_prompt, portrait_edit_prompt
 
 
 MARKDOWN_IMAGE = re.compile(r"!\[[^\]]*]\(([^)\s]+)\)")
@@ -852,7 +852,8 @@ class NekoDraw(MaiBotPlugin):
                 "画你自己、你的自拍、以你为主角或自画像时，用neko_draw并设use_self_reference=true，"
                 "插件会附上管理员提供的角色参考图，按图生图生成；不必先调用query_memory查外貌，不能凭记忆描述替代已配置参考图。"
                 "prompt写本次场景、动作、服装或画风，角色外貌以参考图为主；不要编造图片消息ID或本地文件路径。"
-                "用户明确指定聊天中原图做修改时使用neko_edit_image，不擅自换成角色参考；其他文生图用neko_draw的默认模式。"
+                "修改用户指定聊天原图用neko_edit_image；若该修改需要机器人角色外貌，再设use_self_reference=true，保留聊天原图并追加角色参考，不用参考图替代编辑对象。"
+                "用户自己的自拍、其他人物和普通场景不等于机器人自画像，不自动选角色参考。Life无人生活插画用neko_life_draw_scene，不附人物图。"
                 "参考图不可用时如实说明，不退回纯文生图或声称已参考。自然语言、标签或混合描述均可。"
             )
         return (
@@ -864,10 +865,10 @@ class NekoDraw(MaiBotPlugin):
 
     @Tool(
         "neko_draw",
-        brief_description="根据已经写好的画面描述生成一张图片",
+        brief_description="生成新图；画机器人自己可用预设角色参考图。",
         detailed_description=(
             "普通文生图；修改聊天中指定图片使用neko_edit_image。"
-            "已配置自画像参考图时，画机器人自己必须设use_self_reference=true，插件附本地角色原图，无需查记忆重建外貌。"
+            "已配置参考时，画机器人自己/机器人自拍设use_self_reference=true，插件附角色原图，无需查记忆重建外貌；其他人物或用户自拍不设。"
             "参考不可用明确失败，不改纯文生图冒充；没有配置参考时按当前规划说明处理。"
             "描述所需主体、效果或风格即可，推荐清楚的自然语言，也接受标签、逗号短语及混合表达，无需列全外貌/场景要素。"
         ),
@@ -875,11 +876,11 @@ class NekoDraw(MaiBotPlugin):
             ToolParameterInfo(
                 name="prompt",
                 param_type=ToolParamType.STRING,
-                description="所需画面或风格，自然语言、标签或混合描述均可",
+                description="本次主体、场景、动作、服装或画风；参考自画像不必重复编造外貌，自然语言/标签均可",
                 required=True,
             ),
             ToolParameterInfo(name="use_self_reference", param_type=ToolParamType.BOOLEAN,
-                              description="画机器人自己/自拍/自画像时设true，使用管理员配置的角色参考图；普通画图不填。不能指定路径或消息ID。", required=False),
+                              description="仅画机器人自己时设true；其他人物、用户自拍、无人场景不填。角色图由管理员配置，不接受路径或消息ID。", required=False),
         ],
     )
     async def draw(self, prompt: str = "", use_self_reference: bool = False, **kwargs: Any) -> Dict[str, Any]:
@@ -920,21 +921,25 @@ class NekoDraw(MaiBotPlugin):
 
     @Tool(
         "neko_edit_image",
-        brief_description="基于聊天里的图片或表情包原图进行改图",
+        brief_description="修改聊天原图；可额外附机器人角色外貌参考。",
         detailed_description=(
             "用户要求修改这张图、换背景、换装、重绘、参考原图时调用。"
             "source_message_id 填当前聊天中图片/表情包或引用消息的真实 ID，也支持上下文短消息编号及工具媒体索引，不能编造。"
             "普通消息不填source_image_index时保留多图/引用；只想修改某张普通图片时填从0开始的source_image_index。上下文短编号/工具媒体索引默认取第0张，索引不用于emoji表情包。动图只取首帧，不修改整段动画。"
-            "prompt 用自然语言说明修改什么、保留什么。原图作为视觉依据，不需要查记忆重建外貌。"
+            "prompt说明修改与保留内容。需要机器人角色外貌时设use_self_reference=true：聊天原图在前，角色参考追加在最后；参考不替换原图，不把所有人物改成该角色。"
+            "默认false不读角色图。最多3张聊天原图加1张参考，超限请用source_image_index明确选原图，不静默丢图。参考或聊天原图不可用均失败，不降级。无需查记忆重建已有视觉依据。"
             "找不到原图就请用户补发，不要改用文生图冒充图生图。"
         ),
         parameters=[
             ToolParameterInfo(name="prompt", param_type=ToolParamType.STRING, description="自然语言的修改要求和保留内容", required=True),
             ToolParameterInfo(name="source_message_id", param_type=ToolParamType.STRING, description="当前聊天中的真实消息ID、短消息编号或工具媒体索引", required=True),
             ToolParameterInfo(name="source_image_index", param_type=ToolParamType.INTEGER, description="可选，指定普通图片在源消息中的索引，从0开始；不用于emoji表情包", required=False),
+            ToolParameterInfo(name="use_self_reference", param_type=ToolParamType.BOOLEAN, description="修改涉及机器人角色并需核对外貌时设true；保留聊天原图并在末尾附角色参考。用户自拍/其他人物默认false，不填本地路径。", required=False),
         ],
     )
-    async def edit_image(self, prompt: str = "", source_message_id: str = "", source_image_index: int | None = None, **kwargs: Any) -> Dict[str, Any]:
+    async def edit_image(self, prompt: str = "", source_message_id: str = "", source_image_index: int | None = None, use_self_reference: bool = False, **kwargs: Any) -> Dict[str, Any]:
+        if not isinstance(prompt, str) or not isinstance(source_message_id, str) or type(use_self_reference) is not bool:
+            return {"success": False, "content": "修改要求、原图编号或自参考参数无效"}
         stream_id = self._stream_id(kwargs)
         if not self.config.plugin.enabled or not stream_id or not prompt.strip():
             return {"success": False, "content": "插件未启用、聊天缺失或修改要求为空"}
@@ -944,10 +949,31 @@ class NekoDraw(MaiBotPlugin):
             images = await resolve_edit_images(self.ctx, stream_id, source_message_id.strip(), kwargs.get("message"), self._image_cache, index=source_image_index)
         except Exception as exc:
             return {"success": False, "content": "无法取得原图：" + self._redact(str(exc))[:300]}
+        source_count = len(images)
+        if not images:
+            return {"success": False, "content": "没有取得聊天原图，未提交；角色参考不能代替待修改原图。"}
+        text = prompt.strip()
+        if use_self_reference:
+            if source_count > 3:
+                return {"success": False, "content": "自参考编辑最多3张聊天原图加1张角色参考；请用source_image_index明确选择原图，未自动丢弃图片。"}
+            settings = (self.config.self_portrait.enabled, self.config.self_portrait.reference_path)
+            if not settings[0] or not settings[1]:
+                return {"success": False, "content": "未启用或配置角色参考图，本次未提交；不会忽略自参考选项。"}
+            try:
+                reference = await asyncio.to_thread(read_reference, settings[1])
+            except Exception:
+                return {"success": False, "content": "角色参考图无法读取或无效，本次未提交，不降级为普通编辑；请管理员检查参考图。"}
+            if settings != (self.config.self_portrait.enabled, self.config.self_portrait.reference_path):
+                return {"success": False, "content": "角色参考配置已更改，本次未提交。"}
+            images = [*images, reference]
+            text = portrait_edit_prompt(text, source_count)
+        if not self.config.plugin.enabled:
+            return {"success": False, "content": "插件已禁用，本次未提交。"}
         if self._active_task(stream_id):
             return {"success": False, "content": "上一张还没画完。\n" + self._status_text(stream_id)}
-        task = self._start_task(stream_id, prompt.strip(), str(kwargs.get("user_id") or ""), images)
-        return {"success": True, "content": f"已读取 {len(images)} 张原图并提交图生图，不代表已经生成成功。完成后直接发图；以下仅为提交时快照，后续以插件实时状态或 neko_draw_status 为准。\n" + task.summary()}
+        task = self._start_task(stream_id, text, str(kwargs.get("user_id") or ""), images)
+        notice = f"已读取 {source_count} 张聊天原图" + ("，并在最后附1张角色外貌参考" if use_self_reference else "")
+        return {"success": True, "content": notice + "并提交图生图，不代表已经生成成功。完成后直接发图；以下仅为提交时快照，后续以插件实时状态或 neko_draw_status 为准。\n" + task.summary()}
 
     @Tool(
         "neko_draw_status",
