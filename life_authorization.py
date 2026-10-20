@@ -1,5 +1,6 @@
 """Small signed Life admission boundary; durable consume-before-execute ledger."""
 
+import asyncio
 import hashlib
 from contextlib import closing
 import hmac
@@ -9,6 +10,45 @@ from pathlib import Path
 import re
 import sqlite3
 import time
+
+
+def target_policy(settings):
+    return (tuple(settings.sessions), tuple(settings.group_ids), tuple(settings.user_ids), settings.account_id)
+
+
+async def target_allowed(ctx, session, policy):
+    """Independent Draw-side QQ grant, based only on bounded Host metadata."""
+    sessions, groups, users, account = policy
+    if not isinstance(session, str) or not session:
+        return False
+    if session in sessions:
+        return True  # Exact legacy grants stay compatible until explicitly removed.
+    if not groups and not users:
+        return False
+    number = lambda value: isinstance(value, str) and re.fullmatch(r"[1-9][0-9]{0,19}", value) is not None
+    if len(groups) > 16 or len(users) > 16 or not all(number(v) for v in (*groups, *users)) or (account and not number(account)):
+        return False
+    try:
+        async with asyncio.timeout(2):
+            rows = await ctx.chat.get_all_streams(platform="qq")
+        # SDK 2.12+ already unwraps {success, streams}; never unwrap it twice.
+        if not isinstance(rows, list) or len(rows) > 512:
+            return False
+        matches = [row for row in rows if isinstance(row, dict) and row.get("session_id") == session]
+        if len(matches) != 1:
+            return False
+        row = matches[0]
+        if row.get("platform") != "qq" or row.get("stream_id", session) != session:
+            return False
+        if account and str(row.get("account_id") or "") != account:
+            return False
+        if row.get("chat_type") == "group" and row.get("is_group_session") is True:
+            return str(row.get("group_id") or "") in groups
+        if row.get("chat_type") == "private" and row.get("is_group_session") is False and row.get("group_id") in (None, ""):
+            return str(row.get("user_id") or "") in users
+    except Exception:
+        return False
+    return False
 
 
 def authenticate(packet, directory):

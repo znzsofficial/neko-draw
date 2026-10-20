@@ -1,6 +1,6 @@
 # Neko 生图
 
-1.3.0：新增默认关闭的签名Life配图执行端，双方独立授权、会话隔离和持久防重放；详见文末。
+1.3.1：Life配图授权支持直接填QQ群号/私聊QQ号，可限定机器人账号；保留旧session高级兼容、双方独立授权和持久防重放。
 
 1.2.11：移除文生图工具及命令对标签、逗号短语和solo/highres等字样的硬拒绝，接受自然语言/标签/混合描述，不要求列全外貌和场景。**无原图自画像仍要求先query_memory查询外貌**，查到的特征作基础，用户指定新造型作为本次创作设定，不冒称记忆。缩短Planner路由提示及工具/参数重复说明；真实源图、权限、大小、防并发任务和供应商审核不变。不自动重写用户prompt、不降低供应商限制，不保证模型每次查记忆。
 
@@ -61,11 +61,30 @@ MaiBot 1.3.6+，插件 SDK 2.12+。许可证是 MIT。
 
 可与Neko Life≥0.4配对，默认关闭。Life的`scripts/configure_bridge.py --draw-data-dir <本插件data_dir>`
 先预览，再加`--approve`生成独立能力密钥，不复制供应商Key。
-双方开关和允许会话均须开启：本插件`life.enabled`/`life.sessions`，Life的`drawing.enabled`/`drawing.sessions`。
+双方开关和目标授权均须开启：本插件`life.enabled`及下述名单，Life的`drawing.enabled`及`drawing.group_ids/user_ids`（或高级sessions）。
 `neko.draw.life_v1@1`验证HMAC、目标、时间、nonce及持久请求ID后才启动原有后台生图/发送。
 调用者自报ID、未配对、禁用、越权会话、重放或损坏账本均拒绝；重载后已接纳请求不会再次生图。
 `life-admission.db`存于私有data_dir，需随密钥备份，不能删除来重试未知工作。
 普通`neko_draw`/改图和供应商配置保持不变；Life只生成无人生活环境插画，自画像仍先查询外貌记忆。
+
+Life配图**共用本插件当前主生图引擎**，不是另一套模型；切换general.provider会同时作用普通生图与Life环境配图。仅改授权名单不会切模型、改变重试/冷却或触发生成。
+
+### Life群号/QQ号配置（1.3.1）
+
+```toml
+[life]
+enabled = false       # 新安装默认关；原安装选择不自动变
+group_ids = []        # 每项一个QQ群号字符串，如"123456789"，最多16项
+user_ids = []         # 私聊QQ号，最多16项，不授权该用户所在群
+account_id = ""      # 可选：机器人QQ号限制，不是聊天对象QQ号
+sessions = []         # 高级兼容精确宿主会话ID
+```
+
+号码使用无空格/前导零/qq:前缀的ASCII纯数字。群私同号不混用；只查询宿主已有QQ会话列表（最多512条、2秒），以签名中的session精确匹配平台/聊天类型/目标/机器人账号，不猜session编码、不创建新聊天、不跨请求缓存。缺能力/查不到/超时/重复不明确会话均拒绝，未知仍不重放。
+
+旧sessions与新号码**取并集**，空新字段不会撤销旧授权；迁移须删除同一目标的旧session，否则只删群号仍可能被旧ID放行。多机器人迁移应填原account_id，在已有元数据里核对授权集合未扩大；未确认的旧会话保留高级字段、不猜号码。Life侧号码与Draw侧号码仍需分别允许，不能只开一边就绕过另一边。
+
+宿主lookup后及持久admission后重查配置/总开关，撤销名单或更改账号时未开始的任务拒绝。已交给供应商的工作不能承诺撤回；热重载按原生命周期取消/结算，不能删除life-admission.db来重试未知任务。测试仅假密钥/合成会话与Mock生成发送，不宣称真实QQ投递已验收。
 无新增每日生图成本限额，Life另保留同场景去重及可配置防刷屏冷却；submitted不是QQ客户端送达证明。
 与Life0.4的签名执行、重载防重放及真实供应商生图已验证（私有图片捕获，无额外QQ发送）；
 Linux/Windows×Python3.12/3.14完整59项回归通过。提醒终态边界改用绝对deadline比较，避免浮点相减的平台精度偏差。
@@ -83,7 +102,7 @@ python scripts/package.py
 python scripts/package.py --output neko-draw.zip
 ```
 
-门禁要求至少71项测试、0 skip、0失败，防止缺SDK后关键用例被跳过或发现0项仍成功。
+门禁要求至少83项测试、0 skip、0失败，防止缺SDK后关键用例被跳过或发现0项仍成功。
 `tzdata` 显式安装，避免Windows与Linux时区数据库差异。新增公网下载回归全部使用MockTransport/假会话：
 混合公网/内网DNS、空解析、IPv4映射、当前机器地址、逐跳验证、DNS重绑定、重定向上限、固定IP及Host/TLS SNI、
 代理传输参数、分块响应限额；不访问测试域名/真实供应商、不付费生成、不发送QQ。共享`public_http.py`未修改。

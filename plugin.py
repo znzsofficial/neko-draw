@@ -21,6 +21,7 @@ from .source_images import ImageCache, extract, mime_type, resolve_edit_images
 from .public_http import PublicClient, download_public, local_addresses
 from .result_images import MAX_IMAGE_BYTES, decode_image, read_response, validate_image
 from .life_authorization import authenticate as authenticate_life, consume as consume_life
+from .life_authorization import target_allowed as life_target_allowed, target_policy as life_target_policy
 
 
 MARKDOWN_IMAGE = re.compile(r"!\[[^\]]*]\(([^)\s]+)\)")
@@ -88,8 +89,18 @@ class GeminiConfig(PluginConfigBase):
 
 
 class LifeConfig(PluginConfigBase):
-    enabled: bool = Field(default=False, description="允许已配对Life服务自主配图，独立于普通生图工具")
-    sessions: List[str] = Field(default_factory=list, description="允许Life配图的宿主会话ID；空列表拒绝")
+    __ui_label__ = "Life配图授权"
+
+    enabled: bool = Field(default=False, description="允许已配对Life服务自主配图，独立于普通生图工具",
+                          json_schema_extra={"label": "允许Life自主配图", "hint": "仍须Life侧允许同一聊天；不影响普通生图工具，也不选择另一套生成模型。"})
+    group_ids: List[str] = Field(default_factory=list, max_length=16, description="允许Life配图的QQ群号，最多16项",
+                                json_schema_extra={"label": "允许的QQ群号", "hint": "每项纯数字群号；只匹配宿主已有QQ会话，不创建聊天。与高级会话ID取并集，撤权须一并移除旧ID。"})
+    user_ids: List[str] = Field(default_factory=list, max_length=16, description="允许Life配图的私聊QQ号，最多16项",
+                               json_schema_extra={"label": "允许私聊的QQ号", "hint": "只授权私聊，不授权该用户所在群。与群号分开填写，查询失败拒绝。"})
+    account_id: str = Field(default="", max_length=20, description="可选机器人QQ账号限制",
+                            json_schema_extra={"label": "高级：限定机器人QQ账号", "hint": "多个机器人时限定原账号，留空不额外限定；不是聊天对象QQ号。"})
+    sessions: List[str] = Field(default_factory=list, description="高级兼容：精确宿主会话ID，与群号/QQ号取并集",
+                               json_schema_extra={"label": "高级：允许的宿主会话ID", "hint": "日常填群号/QQ号即可；迁移后移除对应旧ID，否则只删号码不能撤权。所有名单都空拒绝。"})
 
 
 class PluginConfig(PluginConfigBase):
@@ -573,14 +584,17 @@ class NekoDraw(MaiBotPlugin):
             try:
                 body, nonce = authenticate_life(packet, self.ctx.paths.data_dir)
                 session = body['session_id']
-                if session not in self.config.life.sessions:
+                policy = life_target_policy(self.config.life)
+                if not await life_target_allowed(self.ctx, session, policy):
                     return {'success': False, 'status': 'session_denied'}
+                if not self._life_policy_current(policy):
+                    return {'success': False, 'status': 'cancelled'}
                 fresh = await asyncio.to_thread(consume_life, self.ctx.paths.data_dir, body, nonce)
                 task_id = body['request_id']
                 if not fresh:
                     task = self._tasks.get(task_id)
                     return {'success': True, 'status': task.status if task else 'unknown', 'task_id': task_id}
-                if self._life_closed or not self.config.plugin.enabled or not self.config.life.enabled or session not in self.config.life.sessions:
+                if not self._life_policy_current(policy):
                     return {'success': False, 'status': 'cancelled'}
                 if self._active_task(session):
                     return {'success': False, 'status': 'busy'}
@@ -591,6 +605,10 @@ class NekoDraw(MaiBotPlugin):
                 return {'success': True, 'status': 'submitted', 'task_id': task_id}
             except Exception:
                 return {'success': False, 'status': 'admission_rejected'}
+
+    def _life_policy_current(self, policy):
+        return (not self._life_closed and self.config.plugin.enabled and self.config.life.enabled
+                and life_target_policy(self.config.life) == policy)
 
     def _start_task(self, stream_id: str, prompt: str, user_id: str, images: Optional[List[bytes]] = None) -> DrawTask:
         active = self._active_task(stream_id)
