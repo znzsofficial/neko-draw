@@ -22,6 +22,7 @@ from .public_http import PublicClient, download_public, local_addresses
 from .result_images import MAX_IMAGE_BYTES, decode_image, read_response, validate_image
 from .life_authorization import authenticate as authenticate_life, consume as consume_life
 from .life_authorization import target_allowed as life_target_allowed, target_policy as life_target_policy
+from .self_reference import read_reference, portrait_prompt
 
 
 MARKDOWN_IMAGE = re.compile(r"!\[[^\]]*]\(([^)\s]+)\)")
@@ -103,12 +104,22 @@ class LifeConfig(PluginConfigBase):
                                json_schema_extra={"label": "高级：允许的宿主会话ID", "hint": "日常填群号/QQ号即可；迁移后移除对应旧ID，否则只删号码不能撤权。所有名单都空拒绝。"})
 
 
+class SelfPortraitConfig(PluginConfigBase):
+    __ui_label__ = "自画像参考图"
+
+    enabled: bool = Field(default=False, description="画自己时允许使用管理员配置的本地角色参考图",
+                          json_schema_extra={"label": "使用自画像参考图", "hint": "开启后画自己优先参考图，不再先查记忆重建外貌；普通画图和Life无人场景不受影响。"})
+    reference_path: str = Field(default="", max_length=4096, description="管理员指定的一张本地PNG/JPEG/WebP静态参考图的绝对路径",
+                                json_schema_extra={"label": "本地参考图文件", "hint": "填写图片文件而非目录；最大10MiB/4000万像素。图片作为生图输入交给当前供应商，不在QQ单独发送；不要填写私密文件。"})
+
+
 class PluginConfig(PluginConfigBase):
     plugin: PluginSection = Field(default_factory=PluginSection)
     general: GeneralConfig = Field(default_factory=GeneralConfig)
     command: CommandConfig = Field(default_factory=CommandConfig)
     openai: OpenAIConfig = Field(default_factory=OpenAIConfig)
     gemini: GeminiConfig = Field(default_factory=GeminiConfig)
+    self_portrait: SelfPortraitConfig = Field(default_factory=SelfPortraitConfig)
     life: LifeConfig = Field(default_factory=LifeConfig)
 
 
@@ -655,7 +666,7 @@ class NekoDraw(MaiBotPlugin):
         items = kwargs.get("items")
         messages = kwargs.get("messages")
         if self._is_draw_turn(items if isinstance(items, list) else None, messages if isinstance(messages, list) else None):
-            instruction = self._planner_instruction()
+            instruction = self._planner_instruction(self.config.self_portrait.enabled)
             draw_changed = False
             if isinstance(items, list) and instruction not in "\n".join(self._item_text(item) for item in items):
                 items.append(self._system_item(instruction))
@@ -834,7 +845,16 @@ class NekoDraw(MaiBotPlugin):
         }
 
     @staticmethod
-    def _planner_instruction() -> str:
+    def _planner_instruction(self_reference_enabled: bool = False) -> str:
+        if self_reference_enabled:
+            return (
+                "仅当当前用户确实要求生成图片时，以下生图说明才适用；历史提及、闲聊和取消不构成任务。"
+                "画你自己、你的自拍、以你为主角或自画像时，用neko_draw并设use_self_reference=true，"
+                "插件会附上管理员提供的角色参考图，按图生图生成；不必先调用query_memory查外貌，不能凭记忆描述替代已配置参考图。"
+                "prompt写本次场景、动作、服装或画风，角色外貌以参考图为主；不要编造图片消息ID或本地文件路径。"
+                "用户明确指定聊天中原图做修改时使用neko_edit_image，不擅自换成角色参考；其他文生图用neko_draw的默认模式。"
+                "参考图不可用时如实说明，不退回纯文生图或声称已参考。自然语言、标签或混合描述均可。"
+            )
         return (
             "仅当当前用户确实要求生成图片时，以下生图说明才适用；历史提及、闲聊和取消请求不构成生图任务。"
             "有原图的修改或重绘使用 neko_edit_image，以原图为依据。"
@@ -846,8 +866,9 @@ class NekoDraw(MaiBotPlugin):
         "neko_draw",
         brief_description="根据已经写好的画面描述生成一张图片",
         detailed_description=(
-            "无原图的文生图；修改已有图片使用 neko_edit_image。"
-            "自画像先调用 query_memory 查长期记忆中的外貌，以查到的特征为基础，用户要求的新造型作为本次创作设定，不冒称已有记忆。"
+            "普通文生图；修改聊天中指定图片使用neko_edit_image。"
+            "已配置自画像参考图时，画机器人自己必须设use_self_reference=true，插件附本地角色原图，无需查记忆重建外貌。"
+            "参考不可用明确失败，不改纯文生图冒充；没有配置参考时按当前规划说明处理。"
             "描述所需主体、效果或风格即可，推荐清楚的自然语言，也接受标签、逗号短语及混合表达，无需列全外貌/场景要素。"
         ),
         parameters=[
@@ -857,9 +878,13 @@ class NekoDraw(MaiBotPlugin):
                 description="所需画面或风格，自然语言、标签或混合描述均可",
                 required=True,
             ),
+            ToolParameterInfo(name="use_self_reference", param_type=ToolParamType.BOOLEAN,
+                              description="画机器人自己/自拍/自画像时设true，使用管理员配置的角色参考图；普通画图不填。不能指定路径或消息ID。", required=False),
         ],
     )
-    async def draw(self, prompt: str = "", **kwargs: Any) -> Dict[str, Any]:
+    async def draw(self, prompt: str = "", use_self_reference: bool = False, **kwargs: Any) -> Dict[str, Any]:
+        if not isinstance(prompt, str) or type(use_self_reference) is not bool:
+            return {"success": False, "content": "提示词或自画像参考参数无效"}
         text = prompt.strip()
         stream_id = self._stream_id(kwargs)
         if not self.config.plugin.enabled:
@@ -871,10 +896,26 @@ class NekoDraw(MaiBotPlugin):
         active = self._active_task(stream_id)
         if active is not None:
             return {"success": False, "content": "上一张还没画完。\n" + active.summary()}
-        task = self._start_task(stream_id, text, str(kwargs.get("user_id") or ""))
+        images = None
+        if use_self_reference:
+            reference = self.config.self_portrait
+            settings = (reference.enabled, reference.reference_path)
+            if not reference.enabled or not reference.reference_path:
+                return {"success": False, "content": "未启用或配置自画像参考图，未提交生图；请管理员配置参考图。"}
+            try:
+                images = [await asyncio.to_thread(read_reference, reference.reference_path)]
+            except Exception:
+                return {"success": False, "content": "自画像参考图无法读取、已变化或格式/大小无效，未生成，不退回纯文生图。请管理员检查参考文件。"}
+            if not self.config.plugin.enabled or settings != (self.config.self_portrait.enabled, self.config.self_portrait.reference_path):
+                return {"success": False, "content": "参考图配置在读取期间已更改，本次未提交。"}
+            active = self._active_task(stream_id)
+            if active is not None:
+                return {"success": False, "content": "上一张还没画完。\n" + active.summary()}
+            text = portrait_prompt(text)
+        task = self._start_task(stream_id, text, str(kwargs.get("user_id") or ""), images) if images else self._start_task(stream_id, text, str(kwargs.get("user_id") or ""))
         return {
             "success": True,
-            "content": "提交成功，不代表已经生成成功。完成后直接发图；以下仅为提交时快照，后续以插件实时状态或 neko_draw_status 为准。\n" + task.summary(),
+            "content": ("已附角色参考图，按图生图提交。" if images else "") + "提交成功，不代表已经生成成功。完成后直接发图；以下仅为提交时快照，后续以插件实时状态或 neko_draw_status 为准。\n" + task.summary(),
         }
 
     @Tool(
