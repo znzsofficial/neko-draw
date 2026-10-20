@@ -23,6 +23,15 @@ class ImageLimits(unittest.IsolatedAsyncioTestCase):
     def test_base64_limit_before_decode(self):
         with self.assertRaises(ValueError): decode_image('A' * (24*1024*1024))
 
+    def test_truncated_jpeg_must_decode_pixels_not_just_verify_header(self):
+        buffer = io.BytesIO()
+        Image.new('RGB', (128, 128), 'blue').save(buffer, format='JPEG')
+        truncated = buffer.getvalue()[:-30]
+        with Image.open(io.BytesIO(truncated)) as image:
+            image.verify()  # JPEG verify alone accepts the damaged pixel stream.
+        with self.assertRaises(ValueError):
+            validate_image(truncated)
+
     async def test_streaming_response_limit(self):
         class Content:
             async def iter_chunked(self, size):

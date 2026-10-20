@@ -29,6 +29,10 @@ MARKDOWN_IMAGE = re.compile(r"!\[[^\]]*]\(([^)\s]+)\)")
 DATA_URL = re.compile(r"data:image/[\w.+-]+;base64,([A-Za-z0-9+/=\s]+)", re.IGNORECASE)
 
 
+class GenerationUncertain(RuntimeError):
+    """A request may have reached the supplier; do not retry or switch routes."""
+
+
 class PromptRejected(RuntimeError):
     """接口返回 HTTP 400，不自动重试；具体原因以实际错误说明为准。"""
 
@@ -131,6 +135,7 @@ class DrawTask:
         self.task_id = task_id
         self.stream_id = stream_id
         self.prompt = prompt
+        self.display_prompt = prompt
         self.user_id = user_id
         self.status = "queued"
         self.images: List[bytes] = []
@@ -144,7 +149,7 @@ class DrawTask:
         self.terminal_hint_used = False
 
     def touch(self, status: str, **fields: Any) -> None:
-        if status in {'succeeded', 'failed'} and self.status not in {'succeeded', 'failed'}:
+        if status in {'succeeded', 'failed', 'unknown'} and self.status not in {'succeeded', 'failed', 'unknown'}:
             self.terminal_at = time.monotonic()
             self.terminal_hint_used = False
         self.status = status
@@ -159,11 +164,12 @@ class DrawTask:
             "retrying": "重试中",
             "succeeded": "已发送",
             "failed": "失败",
+            "unknown": "结果未知（不自动重试或补发）",
         }
         lines = [
             f"任务 {self.task_id}",
             f"状态：{labels.get(self.status, self.status)}（第 {max(self.attempt, 1)}/{self.max_attempts} 次）",
-            f"提示词：{self.prompt[:80]}",
+            f"提示词：{self.display_prompt[:80]}",
         ]
         if self.provider:
             lines.append(f"接口：{self.provider}")
@@ -259,6 +265,8 @@ class NekoDraw(MaiBotPlugin):
             text = raw.decode("utf-8", "replace")
             if response.status == 400:
                 raise PromptRejected(f"HTTP 400：{text[:500]}")
+            if response.status == 408 or response.status >= 500:
+                raise GenerationUncertain(f"HTTP {response.status}：供应商是否已执行未知，不自动重试或切换接口")
             if response.status != 200:
                 raise RuntimeError(f"HTTP {response.status}：{text[:500]}")
             try:
@@ -377,6 +385,8 @@ class NekoDraw(MaiBotPlugin):
                 text = raw.decode("utf-8", "replace")
                 if response.status == 400:
                     raise PromptRejected(f"HTTP 400：{text[:500]}")
+                if response.status == 408 or response.status >= 500:
+                    raise GenerationUncertain(f"HTTP {response.status}：供应商是否已执行未知，不自动重试或切换接口")
                 if response.status != 200:
                     raise RuntimeError(f"HTTP {response.status}：{text[:500]}")
                 body = json.loads(raw)
@@ -426,11 +436,21 @@ class NekoDraw(MaiBotPlugin):
                 task.touch("running" if attempt == 1 else "retrying", attempt=attempt, provider=label)
             try:
                 return await func()
+            except GenerationUncertain:
+                raise
+            except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+                if not isinstance(exc, aiohttp.ClientConnectorError):
+                    raise GenerationUncertain("网络超时或连接中断，供应商执行结果未知；不自动重试或切换接口") from exc
+                last = exc
+                if attempt == attempts:
+                    raise
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 30.0)
             except Exception as exc:
                 last = exc
                 if not self._retryable(exc) or attempt == attempts:
                     raise
-                self.ctx.logger.info("%s 第 %s 次失败，%.1f 秒后重试：%s", label, attempt, delay, str(exc)[:300])
+                self.ctx.logger.info("%s 第 %s 次失败，%.1f 秒后重试：%s", label, attempt, delay, self._redact(str(exc))[:300])
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 30.0)
         raise last
@@ -459,7 +479,7 @@ class NekoDraw(MaiBotPlugin):
                 else:
                     self._preferred_openai_mode = name
                 return image
-            except PromptRejected:
+            except (PromptRejected, GenerationUncertain):
                 raise
             except Exception as exc:
                 errors.append(str(exc))
@@ -537,7 +557,7 @@ class NekoDraw(MaiBotPlugin):
                     return await self._openai(prompt, task), name
                 if name == "gemini":
                     return await self._gemini(prompt, task), name
-            except PromptRejected:
+            except (PromptRejected, GenerationUncertain):
                 raise
             except Exception as exc:
                 message = self._redact(str(exc))
@@ -633,21 +653,26 @@ class NekoDraw(MaiBotPlugin):
         return task
 
     async def _run_task(self, task: DrawTask) -> None:
+        sending = False
         try:
             image, provider = await self._generate(task.prompt, task)
-            await self._send(image, task.stream_id, task.prompt)
+            sending = True
+            await self._send(image, task.stream_id, task.display_prompt)
             task.touch("succeeded", provider=provider, error="")
             self.ctx.logger.info("任务 %s 已用 %s 发送", task.task_id, provider)
         except asyncio.CancelledError:
-            task.touch("failed", error="插件已卸载，任务取消")
+            uncertain = sending or task.status in {"running", "retrying"}
+            task.touch("unknown" if uncertain else "failed", error="任务已取消；已发起的外部执行或发送结果未知，不自动重试或补发" if uncertain else "插件已卸载，任务取消")
             raise
+        except GenerationUncertain as exc:
+            task.touch("unknown", error=self._redact(str(exc)))
         except PromptRejected as exc:
             message = self._policy_feedback(task.prompt, str(exc))
             task.touch("failed", error=message)
             self.ctx.logger.info("任务 %s 被接口以 400 拒绝：%s", task.task_id, message[:300])
         except Exception as exc:
             message = self._redact(str(exc))
-            task.touch("failed", error=message)
+            task.touch("unknown" if sending else "failed", error=("图片发送结果未知，不自动补发。" + message) if sending else message)
             self.ctx.logger.error("任务 %s 失败：%s", task.task_id, message[:500])
         finally:
             task.images = []
@@ -665,7 +690,7 @@ class NekoDraw(MaiBotPlugin):
         changed = self._inject_task_status(kwargs)
         items = kwargs.get("items")
         messages = kwargs.get("messages")
-        if self._is_draw_turn(items if isinstance(items, list) else None, messages if isinstance(messages, list) else None):
+        if self.config.plugin.enabled and self._is_draw_turn(items if isinstance(items, list) else None, messages if isinstance(messages, list) else None):
             instruction = self._planner_instruction(self.config.self_portrait.enabled)
             draw_changed = False
             if isinstance(items, list) and instruction not in "\n".join(self._item_text(item) for item in items):
@@ -748,14 +773,15 @@ class NekoDraw(MaiBotPlugin):
         if task is None:
             return changed
         else:
-            terminal = task.status in {'succeeded', 'failed'}
+            terminal = task.status in {'succeeded', 'failed', 'unknown'}
             if terminal and (task.terminal_hint_used or task.terminal_at is None
                              or time.monotonic() >= task.terminal_at + 900):
                 return changed
-            if task.status not in {'queued', 'running', 'retrying', 'succeeded', 'failed'}:
+            if task.status not in {'queued', 'running', 'retrying', 'succeeded', 'failed', 'unknown'}:
                 return changed
             states = {"queued": "已提交，尚未开始", "running": "正在执行", "retrying": "正在重试",
-                      "succeeded": "已完成，图片发送接口已确认发送", "failed": "已失败或取消，不在排队，也不会继续执行"}
+                       "succeeded": "已完成，图片发送接口已确认发送", "failed": "已失败或取消，不在排队，也不会继续执行",
+                       "unknown": "外部执行或图片发送结果未知，不自动重试、换工具重画或补发；不要声称成功或确定失败"}
             state = f"任务 {task.task_id}：{states.get(task.status, '状态未知')}。"
             if task.status == "succeeded":
                 state += " 不要再说还在画或等待出图；无需重复发送或仅为宣告完成而刷屏。"
@@ -914,6 +940,7 @@ class NekoDraw(MaiBotPlugin):
                 return {"success": False, "content": "上一张还没画完。\n" + active.summary()}
             text = portrait_prompt(text)
         task = self._start_task(stream_id, text, str(kwargs.get("user_id") or ""), images) if images else self._start_task(stream_id, text, str(kwargs.get("user_id") or ""))
+        task.display_prompt = prompt.strip()
         return {
             "success": True,
             "content": ("已附角色参考图，按图生图提交。" if images else "") + "提交成功，不代表已经生成成功。完成后直接发图；以下仅为提交时快照，后续以插件实时状态或 neko_draw_status 为准。\n" + task.summary(),
@@ -972,6 +999,7 @@ class NekoDraw(MaiBotPlugin):
         if self._active_task(stream_id):
             return {"success": False, "content": "上一张还没画完。\n" + self._status_text(stream_id)}
         task = self._start_task(stream_id, text, str(kwargs.get("user_id") or ""), images)
+        task.display_prompt = prompt.strip()
         notice = f"已读取 {source_count} 张聊天原图" + ("，并在最后附1张角色外貌参考" if use_self_reference else "")
         return {"success": True, "content": notice + "并提交图生图，不代表已经生成成功。完成后直接发图；以下仅为提交时快照，后续以插件实时状态或 neko_draw_status 为准。\n" + task.summary()}
 
@@ -1018,6 +1046,8 @@ class NekoDraw(MaiBotPlugin):
                 return False, "请引用原图，发送 /draw edit <修改要求>", True
             result = await self.edit_image(prompt=parts[1], stream_id=stream_id, user_id=sender, **kwargs)
             return bool(result["success"]), str(result["content"]), True
+        if not self.config.plugin.enabled:
+            return False, "生图插件未启用", True
         active = self._active_task(stream_id)
         if active is not None:
             return False, "上一张还没画完。\n" + active.summary(), True

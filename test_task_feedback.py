@@ -65,7 +65,83 @@ class TaskFeedback(unittest.IsolatedAsyncioTestCase):
         self.bot._send = AsyncMock(side_effect=RuntimeError('delivery failed'))
         self.task.touch('running')
         await self.bot._run_task(self.task)
-        self.assertEqual(self.task.status, 'failed')
+        self.assertEqual(self.task.status, 'unknown')
+        self.assertIn('不自动补发', self.task.summary())
+
+    async def test_uncertain_transport_never_retries_or_falls_back(self):
+        import aiohttp
+
+        self.bot.config.general.retry_times = 3
+        self.bot.config.general.fallback_provider = 'gemini'
+        self.bot.config.openai.mode = 'auto'
+        self.bot._preferred_openai_mode = ''
+        for error in [asyncio.TimeoutError(), aiohttp.ServerDisconnectedError(), self.mod.GenerationUncertain('HTTP 502')]:
+            self.bot._openai_images = AsyncMock(side_effect=error)
+            self.bot._openai_chat = AsyncMock()
+            self.bot._gemini = AsyncMock()
+            with self.assertRaises(self.mod.GenerationUncertain):
+                await self.bot._generate('test', self.task)
+            self.bot._openai_images.assert_awaited_once()
+            self.bot._openai_chat.assert_not_awaited()
+            self.bot._gemini.assert_not_awaited()
+
+    async def test_explicit_rate_limit_still_retries_with_redacted_log(self):
+        self.bot.config.general.retry_times = 1
+        self.bot.config.openai.api_key = 'private-test-key'
+        call = AsyncMock(side_effect=[RuntimeError('HTTP 429 private-test-key'), b'image'])
+        with patch.object(self.mod.asyncio, 'sleep', AsyncMock()):
+            self.assertEqual(await self.bot._call_with_retry(self.task, 'test', call), b'image')
+        self.assertEqual(call.await_count, 2)
+        self.assertNotIn('private-test-key', str(self.bot.ctx.logger.info.call_args_list))
+
+    async def test_http_timeout_and_server_errors_are_uncertain_on_both_post_routes(self):
+        for status in [408, 500, 502, 503, 504]:
+            response = types.SimpleNamespace(status=status)
+            context = AsyncMock()
+            context.__aenter__.return_value = response
+            self.bot._http = AsyncMock(return_value=types.SimpleNamespace(post=Mock(return_value=context)))
+            with patch.object(self.mod, 'read_response', AsyncMock(return_value=b'upstream error')):
+                with self.assertRaises(self.mod.GenerationUncertain):
+                    await self.bot._post_json('https://example.com', {}, {}, '')
+                self.bot.config.openai.api_key = 'synthetic'
+                with patch.object(self.mod, 'mime_type', return_value='image/png'):
+                    with self.assertRaises(self.mod.GenerationUncertain):
+                        await self.bot._openai_images('edit', self.bot.config.openai, [b'synthetic'])
+
+    async def test_unknown_generation_and_send_cancellation_preserve_unknown(self):
+        self.bot._generate = AsyncMock(side_effect=self.mod.GenerationUncertain('supplier unknown'))
+        self.bot._send = AsyncMock()
+        self.task.images = [b'secret']
+        await self.bot._run_task(self.task)
+        self.assertEqual(self.task.status, 'unknown')
+        self.assertEqual(self.task.images, [])
+        self.bot._send.assert_not_awaited()
+        response = await self.bot.configure_planner(session_id='chat-a', items=[])
+        self.assertIn('不要声称成功或确定失败', str(response))
+        self.bot._generate = AsyncMock(return_value=(b'image', 'fake'))
+        self.bot._send = AsyncMock(side_effect=asyncio.CancelledError())
+        with self.assertRaises(asyncio.CancelledError):
+            await self.bot._run_task(self.task)
+        self.assertEqual(self.task.status, 'unknown')
+
+    async def test_internal_reference_instructions_not_used_for_history_or_summary(self):
+        self.task.prompt = 'internal reference rules'
+        self.task.display_prompt = '窗边阅读'
+        self.bot._generate = AsyncMock(return_value=(b'image', 'fake'))
+        self.bot._send = AsyncMock()
+        await self.bot._run_task(self.task)
+        self.bot._generate.assert_awaited_once_with('internal reference rules', self.task)
+        self.bot._send.assert_awaited_once_with(b'image', 'chat-a', '窗边阅读')
+        self.assertNotIn('internal reference rules', self.task.summary())
+
+    async def test_disabled_command_and_planner_do_not_start_or_advertise_drawing(self):
+        self.bot.config.plugin.enabled = False
+        self.bot.config.command.allowed_user_ids = ['123']
+        self.bot._start_task = Mock()
+        result = await self.bot.cmd_draw(stream_id='chat-a', user_id='123', matched_groups={'payload':'cat'})
+        self.assertFalse(result[0])
+        self.bot._start_task.assert_not_called()
+        self.assertIsNone(await self.bot.configure_planner(session_id='chat-a', messages=[{'role':'user','content':'帮我画一张图'}]))
 
     async def test_lost_state_after_reload_does_not_repeat_old_receipt(self):
         self.bot._tasks.clear(); self.bot._latest_by_stream.clear()

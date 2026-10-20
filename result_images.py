@@ -31,7 +31,9 @@ def validate_image(data: bytes) -> bytes:
                 if image.width * image.height > MAX_PIXELS:
                     raise ValueError("生成图片像素数量过大")
                 image.verify()
-    except (OSError, SyntaxError, Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+            with Image.open(io.BytesIO(data)) as image:
+                image.load()
+    except (OSError, SyntaxError, EOFError, Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
         raise ValueError("接口返回的图片无效") from exc
     return data
 
