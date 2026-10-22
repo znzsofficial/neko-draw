@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "id": "neko.draw",
-  "version": "1.4.3",
+  "version": "1.4.4",
   "name": "Neko 生图",
-  "description": "只用 OpenAI 兼容接口和 Gemini 生图。OpenAI 失败时可以自动改走 Gemini。",
+  "description": "只用 OpenAI 兼容接口和 Gemini 生图。仅明确未执行的失败允许备选，结果未知不重新生成。",
   "author": { "name": "NekoLaska", "url": "https://github.com/znzsofficial" },
   "license": "MIT",
   "urls": {

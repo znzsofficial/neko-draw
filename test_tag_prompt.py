@@ -16,13 +16,14 @@ for node in NODES:
         arg.annotation = None
     if node.args.kwarg:
         node.args.kwarg.annotation = None
-namespace = {}
+namespace = {'MAX_PROMPT_CHARS': 4000}
 exec(compile(ast.Module(body=NODES, type_ignores=[]), 'plugin.py', 'exec'), namespace)
 
 
 class PromptSyntaxTests(unittest.IsolatedAsyncioTestCase):
     def bot(self, allowed=True, active=None):
-        return types.SimpleNamespace(
+        bot = types.SimpleNamespace(
+            _generation_id=lambda: 0,
             config=types.SimpleNamespace(plugin=types.SimpleNamespace(enabled=True)),
             ctx=types.SimpleNamespace(logger=Mock()),
             _stream_id=lambda kw: kw.get('stream_id', ''),
@@ -31,6 +32,10 @@ class PromptSyntaxTests(unittest.IsolatedAsyncioTestCase):
             _status_text=lambda sid: 'status',
             _start_task=Mock(return_value=types.SimpleNamespace(summary=lambda: 'queued')),
         )
+        async def draw(**kwargs):
+            return await namespace['draw'](bot, **kwargs)
+        bot.draw = draw
+        return bot
 
     async def test_tags_short_phrases_and_substrings_accepted_by_tool_and_command(self):
         for text in ['masterpiece, best quality, 1girl, solo, red hair, smile, blush, indoors',

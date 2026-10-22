@@ -252,8 +252,8 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
     async def test_revocation_during_durable_admission_does_not_start_generation(self):
         from unittest.mock import patch
         self.friendly();original=asyncio.to_thread
-        async def revoke(*args):
-            result=await original(*args)
+        async def revoke(*args, **kwargs):
+            result=await original(*args, **kwargs)
             self.bot.config.life.account_id="789"
             return result
         with patch("draw_life_test.plugin.asyncio.to_thread",side_effect=revoke):
@@ -277,8 +277,8 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
     async def test_unload_during_admission_does_not_start_task(self):
         original = asyncio.to_thread
 
-        async def close_during(*args):
-            result = await original(*args)
+        async def close_during(*args, **kwargs):
+            result = await original(*args, **kwargs)
             self.bot._life_closed = True
             return result
 

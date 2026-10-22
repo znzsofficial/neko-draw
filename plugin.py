@@ -9,6 +9,7 @@ import json
 import re
 import time
 import uuid
+from functools import wraps
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional, Tuple
 from urllib.parse import urlsplit
@@ -24,6 +25,7 @@ from .life_authorization import authenticate as authenticate_life, consume as co
 from .life_authorization import target_allowed as life_target_allowed, target_policy as life_target_policy
 from .self_reference import read_reference, portrait_prompt, portrait_edit_prompt
 from .focus_scope import items_for_scope, planner_scopes
+from .resource_budget import MAX_ADMITTED, MAX_GENERATING, MAX_PROMPT_CHARS, image_work
 
 
 MARKDOWN_IMAGE = re.compile(r"!\[[^\]]*]\(([^)\s]+)\)")
@@ -32,6 +34,27 @@ DATA_URL = re.compile(r"data:image/[\w.+-]+;base64,([A-Za-z0-9+/=\s]+)", re.IGNO
 
 class GenerationUncertain(RuntimeError):
     """A request may have reached the supplier; do not retry or switch routes."""
+
+
+class GenerationNotSubmitted(RuntimeError):
+    """Explicit rejection or connection establishment failure; fallback is safe."""
+
+
+def admitted(method):
+    """Reserve before any asynchronous source/portrait preprocessing."""
+    @wraps(method)
+    async def wrapped(self, *args, **kwargs):
+        stream = self._stream_id(kwargs)
+        generation = self._generation_id()
+        if not self._current(generation):
+            return {"success": False, "content": "插件已关闭，本次未提交。"}
+        if not self._reserve(stream):
+            return {"success": False, "content": "任务繁忙或全局容量已满，本次未提交，请稍后再试。"}
+        try:
+            return await method(self, *args, **kwargs)
+        finally:
+            self._reservations.pop(stream, None)
+    return wrapped
 
 
 class PromptRejected(RuntimeError):
@@ -49,7 +72,7 @@ class GeneralConfig(PluginConfigBase):
     __ui_label__ = "通用"
 
     provider: Literal["openai", "gemini"] = Field(default="openai", description="优先使用的接口")
-    fallback_provider: Literal["none", "openai", "gemini"] = Field(default="gemini", description="失败后改试的接口。none 表示不备选")
+    fallback_provider: Literal["none", "openai", "gemini"] = Field(default="gemini", description="明确未执行的失败后改试的接口；结果未知不改试。none 表示不备选")
     timeout: int = Field(default=180, ge=10, le=300, description="单次请求超时秒数")
     retry_times: int = Field(default=2, ge=0, le=5, description="同一个接口额外重试次数。0 表示不重试")
     retry_delay_seconds: float = Field(default=2.0, ge=0.5, le=30.0, description="首次重试前等待秒数，之后翻倍，最多 30 秒")
@@ -74,7 +97,7 @@ class OpenAIConfig(PluginConfigBase):
     size: str = Field(default="1024x1024", description="图片尺寸，例如 1024x1024")
     mode: Literal["auto", "images", "chat"] = Field(
         default="auto",
-        description="auto=官方生图接口失败后再试聊天补全",
+        description="auto=官方生图接口明确未执行时才改试聊天补全；成功响应后取图失败不改试",
     )
     proxy: str = Field(default="", description="HTTP 代理。国内中转留空")
 
@@ -195,19 +218,46 @@ class NekoDraw(MaiBotPlugin):
         self._image_cache = ImageCache()
         self._life_lock = asyncio.Lock()
         self._life_closed = False
+        self._generation = 0
+        self._reservations = {}
+        self._generation_slots = asyncio.Semaphore(MAX_GENERATING)
+
+    def _generation_id(self):
+        return getattr(self, '_generation', 0)
+
+    def _current(self, generation):
+        return (generation == self._generation_id() and not getattr(self, '_life_closed', False)
+                and self.config.plugin.enabled)
+
+    def _reserve(self, stream):
+        if not hasattr(self, '_reservations'):
+            self._reservations = {}
+        occupied = set(self._reservations) | {t.stream_id for t in self._tasks.values()
+                                               if t.status in {'queued', 'running', 'retrying'}}
+        if stream in occupied or len(occupied) >= MAX_ADMITTED:
+            return False
+        self._reservations[stream] = self._generation_id()
+        return True
 
     @HookHandler("chat.receive.before_process", name="neko_source_images",
                   description="缓存本聊天入站图片/表情包原图供图生图使用", mode=HookMode.OBSERVE)
     async def cache_source_images(self, message: Any = None, stream_id: str = "", **kwargs: Any) -> None:
+        generation = self._generation_id()
         if not self.config.plugin.enabled or not isinstance(message, dict):
             return
         stream = str(stream_id or kwargs.get("session_id") or message.get("session_id") or message.get("chat_id") or message.get("stream_id") or "")
         if stream:
+            if not self._current(generation) or getattr(self, '_cache_pending', 0) >= MAX_ADMITTED:
+                return
+            self._cache_pending = getattr(self, '_cache_pending', 0) + 1
             try:
-                images = await asyncio.to_thread(extract, message)
-                self._image_cache.put(stream, message, images=images)
+                images = await image_work(extract, message)
+                if self._current(generation):
+                    self._image_cache.put(stream, message, images=images)
             except (ValueError, TypeError):
                 self.ctx.logger.debug("入站图片无法缓存，图生图时可尝试按消息 ID 读取")
+            finally:
+                self._cache_pending -= 1
 
     async def on_load(self) -> None:
         self._life_closed = False
@@ -222,6 +272,7 @@ class NekoDraw(MaiBotPlugin):
 
     async def on_unload(self) -> None:
         self._life_closed = True
+        self._generation = self._generation_id() + 1
         runners = list(self._runners.values())
         for runner in runners:
             runner.cancel()
@@ -246,6 +297,8 @@ class NekoDraw(MaiBotPlugin):
         self._life_closed = False
 
     async def _http(self) -> aiohttp.ClientSession:
+        if not self._current(self._generation_id()):
+            raise asyncio.CancelledError
         if self._session is None or self._session.closed:
             timeout = aiohttp.ClientTimeout(total=self.config.general.timeout)
             self._session = aiohttp.ClientSession(timeout=timeout)
@@ -262,27 +315,39 @@ class NekoDraw(MaiBotPlugin):
         session = await self._http()
         request_proxy = proxy.strip() or None
         async with session.post(url, json=payload, headers=headers, proxy=request_proxy) as response:
+            return await self._generation_response(response)
+
+    async def _generation_response(self, response):
+        # Any successful submission is a one-way boundary, including body reads.
+        try:
             raw = await read_response(response)
-            text = raw.decode("utf-8", "replace")
-            if response.status == 400:
-                raise PromptRejected(f"HTTP 400：{text[:500]}")
-            if response.status == 408 or response.status >= 500:
-                raise GenerationUncertain(f"HTTP {response.status}：供应商是否已执行未知，不自动重试或切换接口")
-            if response.status != 200:
-                raise RuntimeError(f"HTTP {response.status}：{text[:500]}")
-            try:
-                data = json.loads(raw)
-            except Exception as exc:
-                raise RuntimeError("接口返回了非 JSON") from exc
-        if not isinstance(data, dict):
-            raise RuntimeError("接口返回的 JSON 不是对象")
-        return data
+        except Exception as exc:
+            raise GenerationUncertain("提交后响应读取失败；执行结果未知，不重新生成") from exc
+        if response.status == 400:
+            raise PromptRejected("HTTP 400：" + self._redact(raw.decode('utf-8', 'replace'))[:500])
+        if response.status in {401, 403, 404, 405, 415, 422, 429}:
+            raise GenerationNotSubmitted(f"HTTP {response.status}：" + self._redact(raw.decode('utf-8', 'replace'))[:500])
+        if response.status != 200:
+            raise GenerationUncertain(f"HTTP {response.status}：供应商是否已执行未知，不自动重试或切换接口")
+        try:
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError('not an object')
+            return data
+        except Exception as exc:
+            raise GenerationUncertain("HTTP 200 后响应 JSON 无效；不重新生成") from exc
+
+    async def _openai_result(self, body, proxy):
+        try:
+            return (await self._images_from_openai_body(body, proxy))[0]
+        except Exception as exc:
+            raise GenerationUncertain("供应商已返回成功，图片读取/校验失败或无图片；不重新生成") from exc
 
     async def _download(self, url: str, proxy: str) -> bytes:
         async with PublicClient(timeout=self.config.general.timeout, proxy=proxy.strip() or None) as client:
             body, _, _ = await download_public(client, url, max_image_bytes=MAX_IMAGE_BYTES,
                                                 blocked_ips=local_addresses())
-        return await asyncio.to_thread(validate_image, body)
+        return await image_work(validate_image, body)
 
     async def _bytes_from_reference(self, value: str, proxy: str) -> Optional[bytes]:
         text = value.strip()
@@ -292,13 +357,13 @@ class NekoDraw(MaiBotPlugin):
             raise ValueError("生成图片引用超过大小限制")
         data_match = DATA_URL.search(text)
         if data_match:
-            return await asyncio.to_thread(decode_image, data_match.group(1))
+            return await image_work(decode_image, data_match.group(1))
         if text.startswith("http://") or text.startswith("https://"):
             return await self._download(text, proxy)
         compact = re.sub(r"\s+", "", text)
         if len(compact) > 200 and re.fullmatch(r"[A-Za-z0-9+/=]+", compact):
             try:
-                decoded = await asyncio.to_thread(decode_image, compact)
+                decoded = await image_work(decode_image, compact)
             except Exception:
                 return None
             if decoded.startswith(b"\x89PNG") or decoded.startswith(b"\xff\xd8") or decoded.startswith(b"RIFF"):
@@ -366,7 +431,7 @@ class NekoDraw(MaiBotPlugin):
 
     async def _openai_images(self, prompt: str, cfg: OpenAIConfig, images: Optional[List[bytes]] = None) -> bytes:
         if not cfg.api_key.strip():
-            raise RuntimeError("未配置 OpenAI API Key")
+            raise GenerationNotSubmitted("未配置 OpenAI API Key")
         root = self._root(cfg.base_url)
         if images:
             form = aiohttp.FormData()
@@ -382,16 +447,8 @@ class NekoDraw(MaiBotPlugin):
             async with session.post(f"{root}/v1/images/edits", data=form,
                                     headers={"Authorization": f"Bearer {cfg.api_key.strip()}"},
                                     proxy=cfg.proxy.strip() or None) as response:
-                raw = await read_response(response)
-                text = raw.decode("utf-8", "replace")
-                if response.status == 400:
-                    raise PromptRejected(f"HTTP 400：{text[:500]}")
-                if response.status == 408 or response.status >= 500:
-                    raise GenerationUncertain(f"HTTP {response.status}：供应商是否已执行未知，不自动重试或切换接口")
-                if response.status != 200:
-                    raise RuntimeError(f"HTTP {response.status}：{text[:500]}")
-                body = json.loads(raw)
-            return (await self._images_from_openai_body(body, cfg.proxy))[0]
+                body = await self._generation_response(response)
+            return await self._openai_result(body, cfg.proxy)
         headers = {"Authorization": f"Bearer {cfg.api_key.strip()}", "Content-Type": "application/json"}
         payload: Dict[str, Any] = {"model": cfg.model.strip(), "prompt": prompt, "n": 1}
         if cfg.size.strip():
@@ -399,11 +456,11 @@ class NekoDraw(MaiBotPlugin):
         if "gpt-image" not in cfg.model.lower():
             payload["response_format"] = "b64_json"
         body = await self._post_json(f"{root}/v1/images/generations", payload, headers, cfg.proxy)
-        return (await self._images_from_openai_body(body, cfg.proxy))[0]
+        return await self._openai_result(body, cfg.proxy)
 
     async def _openai_chat(self, prompt: str, cfg: OpenAIConfig, images: Optional[List[bytes]] = None) -> bytes:
         if not cfg.api_key.strip():
-            raise RuntimeError("未配置 OpenAI API Key")
+            raise GenerationNotSubmitted("未配置 OpenAI API Key")
         root = self._root(cfg.base_url)
         headers = {"Authorization": f"Bearer {cfg.api_key.strip()}", "Content-Type": "application/json"}
         payload = {
@@ -417,14 +474,14 @@ class NekoDraw(MaiBotPlugin):
             "stream": False,
         }
         body = await self._post_json(f"{root}/v1/chat/completions", payload, headers, cfg.proxy)
-        return (await self._images_from_openai_body(body, cfg.proxy))[0]
+        return await self._openai_result(body, cfg.proxy)
 
     @staticmethod
     def _retryable(exc: Exception) -> bool:
-        if isinstance(exc, (asyncio.TimeoutError, aiohttp.ClientError)):
-            return True
-        text = str(exc)
-        return any(code in text for code in ("HTTP 408", "HTTP 429", "HTTP 500", "HTTP 502", "HTTP 503", "HTTP 504"))
+        # Never infer permission to submit again from arbitrary exception text.
+        # Connector establishment is handled separately; every post-submit read
+        # failure (even a result URL returning 429) is GenerationUncertain.
+        return isinstance(exc, GenerationNotSubmitted) and str(exc).startswith('HTTP 429：')
 
     async def _call_with_retry(self, task: Optional[DrawTask], label: str, func: Any) -> Any:
         attempts = self.config.general.retry_times + 1
@@ -444,7 +501,7 @@ class NekoDraw(MaiBotPlugin):
                     raise GenerationUncertain("网络超时或连接中断，供应商执行结果未知；不自动重试或切换接口") from exc
                 last = exc
                 if attempt == attempts:
-                    raise
+                    raise GenerationNotSubmitted("连接建立失败，未提交供应商") from exc
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 30.0)
             except Exception as exc:
@@ -459,7 +516,7 @@ class NekoDraw(MaiBotPlugin):
     async def _openai(self, prompt: str, task: Optional[DrawTask] = None) -> bytes:
         cfg = self.config.openai
         if not cfg.enabled:
-            raise RuntimeError("OpenAI 未启用")
+            raise GenerationNotSubmitted("OpenAI 未启用")
         editing = bool(task and task.images)
         preferred = self._preferred_openai_edit_mode if editing else self._preferred_openai_mode
         if cfg.mode == "images":
@@ -482,16 +539,16 @@ class NekoDraw(MaiBotPlugin):
                 return image
             except (PromptRejected, GenerationUncertain):
                 raise
-            except Exception as exc:
+            except GenerationNotSubmitted as exc:
                 errors.append(str(exc))
                 if cfg.mode != "auto":
                     break
-        raise RuntimeError("；".join(errors) or "OpenAI 生图失败")
+        raise GenerationNotSubmitted("；".join(errors) or "OpenAI 生图失败")
 
     async def _gemini_native(self, prompt: str, images: Optional[List[bytes]] = None) -> bytes:
         cfg = self.config.gemini
         if not cfg.api_key.strip():
-            raise RuntimeError("未配置 Gemini API Key")
+            raise GenerationNotSubmitted("未配置 Gemini API Key")
         root = cfg.base_url.strip().rstrip("/")
         if root.endswith("/v1beta"):
             url = f"{root}/models/{cfg.model.strip()}:generateContent"
@@ -513,6 +570,12 @@ class NekoDraw(MaiBotPlugin):
         if cfg.aspect_ratio.strip():
             payload["generationConfig"]["imageConfig"] = {"aspectRatio": cfg.aspect_ratio.strip()}
         body = await self._post_json(url, payload, headers, cfg.proxy)
+        try:
+            return await self._gemini_result(body)
+        except Exception as exc:
+            raise GenerationUncertain("供应商已返回成功，Gemini 图片读取/校验失败或无图片；不重新生成") from exc
+
+    async def _gemini_result(self, body):
         images: List[bytes] = []
         for candidate in body.get("candidates") or []:
             if not isinstance(candidate, dict):
@@ -524,7 +587,7 @@ class NekoDraw(MaiBotPlugin):
                 inline = part.get("inlineData") or part.get("inline_data") or {}
                 raw = inline.get("data") if isinstance(inline, dict) else None
                 if isinstance(raw, str) and raw:
-                    return await asyncio.to_thread(decode_image, raw)
+                    return await image_work(decode_image, raw)
         if not images:
             raise RuntimeError("Gemini 响应里没有图片")
         return images[0]
@@ -532,7 +595,7 @@ class NekoDraw(MaiBotPlugin):
     async def _gemini(self, prompt: str, task: Optional[DrawTask] = None) -> bytes:
         cfg = self.config.gemini
         if not cfg.enabled:
-            raise RuntimeError("Gemini 未启用")
+            raise GenerationNotSubmitted("Gemini 未启用")
         if cfg.mode == "openai":
             mirrored = OpenAIConfig(
                 enabled=True,
@@ -560,14 +623,17 @@ class NekoDraw(MaiBotPlugin):
                     return await self._gemini(prompt, task), name
             except (PromptRejected, GenerationUncertain):
                 raise
-            except Exception as exc:
+            except GenerationNotSubmitted as exc:
                 message = self._redact(str(exc))
                 errors.append(f"{name}: {message}")
                 self.ctx.logger.warning("生图接口失败：%s", errors[-1][:500])
         raise RuntimeError("；".join(errors) or "没有可用的生图接口")
 
     async def _send(self, image: bytes, stream_id: str, prompt: str) -> None:
-        await asyncio.to_thread(validate_image, image)
+        generation = self._generation_id()
+        await image_work(validate_image, image)
+        if not self._current(generation):
+            raise asyncio.CancelledError
         encoded = base64.b64encode(image).decode("ascii")
         sent = await self.ctx.send.image(
             encoded,
@@ -610,55 +676,91 @@ class NekoDraw(MaiBotPlugin):
     @API('life_v1', version='1', public=True, description='签名Life配图任务，只接收独立授权且配对的会话')
     async def life_v1(self, packet=None, **kwargs):
         del kwargs
+        # Bound even the callers waiting for signed durable admission/Host lookup.
+        if getattr(self, '_life_pending', 0) >= MAX_ADMITTED:
+            return {'success': False, 'status': 'busy'}
+        self._life_pending = getattr(self, '_life_pending', 0) + 1
+        try:
+            return await self._admit_life(packet)
+        finally:
+            self._life_pending -= 1
+
+    async def _admit_life(self, packet):
+        generation = self._generation_id()
         async with self._life_lock:
-            if self._life_closed or not self.config.plugin.enabled or not self.config.life.enabled:
+            if not self._current(generation) or not self.config.life.enabled:
                 return {'success': False, 'status': 'disabled'}
+            reserved = False
+            session = ''
             try:
                 body, nonce = authenticate_life(packet, self.ctx.paths.data_dir)
                 session = body['session_id']
                 policy = life_target_policy(self.config.life)
                 if not await life_target_allowed(self.ctx, session, policy):
                     return {'success': False, 'status': 'session_denied'}
-                if not self._life_policy_current(policy):
+                if not self._current(generation) or not self._life_policy_current(policy):
                     return {'success': False, 'status': 'cancelled'}
-                fresh = await asyncio.to_thread(consume_life, self.ctx.paths.data_dir, body, nonce)
+                reserved = self._reserve(session)
+                fresh = await asyncio.to_thread(consume_life, self.ctx.paths.data_dir, body, nonce, allow_new=reserved)
                 task_id = body['request_id']
                 if not fresh:
                     task = self._tasks.get(task_id)
                     return {'success': True, 'status': task.status if task else 'unknown', 'task_id': task_id}
-                if not self._life_policy_current(policy):
+                if not self._current(generation) or not self._life_policy_current(policy):
                     return {'success': False, 'status': 'cancelled'}
-                if self._active_task(session):
-                    return {'success': False, 'status': 'busy'}
                 task = DrawTask(task_id, session, body['prompt'], 'neko.life')
+                task.generation = generation
                 task.max_attempts = self.config.general.retry_times + 1
                 self._remember_task(task)
                 self._runners[task_id] = asyncio.create_task(self._run_task(task))
                 return {'success': True, 'status': 'submitted', 'task_id': task_id}
+            except ValueError as exc:
+                return {'success': False, 'status': 'busy' if str(exc) == 'admission_busy' else 'admission_rejected'}
             except Exception:
                 return {'success': False, 'status': 'admission_rejected'}
+            finally:
+                if reserved:
+                    self._reservations.pop(session, None)
 
     def _life_policy_current(self, policy):
         return (not self._life_closed and self.config.plugin.enabled and self.config.life.enabled
                 and life_target_policy(self.config.life) == policy)
 
     def _start_task(self, stream_id: str, prompt: str, user_id: str, images: Optional[List[bytes]] = None) -> DrawTask:
+        if not self._current(self._generation_id()):
+            raise asyncio.CancelledError
+        if len(prompt) > MAX_PROMPT_CHARS + 2000:
+            raise ValueError('提示词过长')
         active = self._active_task(stream_id)
         if active is not None:
             return active
+        owned = stream_id not in getattr(self, '_reservations', {})
+        if owned and not self._reserve(stream_id):
+            raise ValueError('全局任务容量已满，未提交')
         task = DrawTask(uuid.uuid4().hex[:8], stream_id, prompt, user_id)
+        task.generation = self._generation_id()
         task.images = images or []
         task.max_attempts = self.config.general.retry_times + 1
         self._remember_task(task)
         self._runners[task.task_id] = asyncio.create_task(self._run_task(task))
+        if owned:
+            self._reservations.pop(stream_id, None)
         return task
 
     async def _run_task(self, task: DrawTask) -> None:
         sending = False
+        generation = getattr(task, 'generation', self._generation_id())
         try:
-            image, provider = await self._generate(task.prompt, task)
-            sending = True
-            await self._send(image, task.stream_id, task.display_prompt)
+            if not hasattr(self, '_generation_slots'):
+                self._generation_slots = asyncio.Semaphore(MAX_GENERATING)
+            async with self._generation_slots:
+                if not self._current(generation):
+                    raise asyncio.CancelledError
+                image, provider = await self._generate(task.prompt, task)
+                if not self._current(generation):
+                    raise asyncio.CancelledError
+                sending = True
+                await self._send(image, task.stream_id, task.display_prompt)
             task.touch("succeeded", provider=provider, error="")
             self.ctx.logger.info("任务 %s 已用 %s 发送", task.task_id, provider)
         except asyncio.CancelledError:
@@ -942,9 +1044,13 @@ class NekoDraw(MaiBotPlugin):
                               description="仅画机器人自己时设true；其他人物、用户自拍、无人场景不填。角色图由管理员配置，不接受路径或消息ID。", required=False),
         ],
     )
+    @admitted
     async def draw(self, prompt: str = "", use_self_reference: bool = False, **kwargs: Any) -> Dict[str, Any]:
+        generation = self._generation_id()
         if not isinstance(prompt, str) or type(use_self_reference) is not bool:
             return {"success": False, "content": "提示词或自画像参考参数无效"}
+        if len(prompt) > MAX_PROMPT_CHARS:
+            return {"success": False, "content": "提示词最多4000字符，本次未提交。"}
         text = prompt.strip()
         stream_id = self._stream_id(kwargs)
         if not self.config.plugin.enabled:
@@ -963,10 +1069,10 @@ class NekoDraw(MaiBotPlugin):
             if not reference.enabled or not reference.reference_path:
                 return {"success": False, "content": "未启用或配置自画像参考图，未提交生图；请管理员配置参考图。"}
             try:
-                images = [await asyncio.to_thread(read_reference, reference.reference_path)]
+                images = [await image_work(read_reference, reference.reference_path)]
             except Exception:
                 return {"success": False, "content": "自画像参考图无法读取、已变化或格式/大小无效，未生成，不退回纯文生图。请管理员检查参考文件。"}
-            if not self.config.plugin.enabled or settings != (self.config.self_portrait.enabled, self.config.self_portrait.reference_path):
+            if not self._current(generation) or settings != (self.config.self_portrait.enabled, self.config.self_portrait.reference_path):
                 return {"success": False, "content": "参考图配置在读取期间已更改，本次未提交。"}
             active = self._active_task(stream_id)
             if active is not None:
@@ -997,10 +1103,14 @@ class NekoDraw(MaiBotPlugin):
             ToolParameterInfo(name="use_self_reference", param_type=ToolParamType.BOOLEAN, description="修改涉及机器人角色并需核对外貌时设true；保留聊天原图并在末尾附角色参考。用户自拍/其他人物默认false，不填本地路径。", required=False),
         ],
     )
+    @admitted
     async def edit_image(self, prompt: str = "", source_message_id: str = "", source_image_index: int | None = None, use_self_reference: bool = False, **kwargs: Any) -> Dict[str, Any]:
+        generation = self._generation_id()
         if not isinstance(prompt, str) or not isinstance(source_message_id, str) or type(use_self_reference) is not bool:
             return {"success": False, "content": "修改要求、原图编号或自参考参数无效"}
         stream_id = self._stream_id(kwargs)
+        if len(prompt) > MAX_PROMPT_CHARS:
+            return {"success": False, "content": "提示词最多4000字符，本次未提交。"}
         if not self.config.plugin.enabled or not stream_id or not prompt.strip():
             return {"success": False, "content": "插件未启用、聊天缺失或修改要求为空"}
         if self._active_task(stream_id):
@@ -1009,6 +1119,8 @@ class NekoDraw(MaiBotPlugin):
             images = await resolve_edit_images(self.ctx, stream_id, source_message_id.strip(), kwargs.get("message"), self._image_cache, index=source_image_index)
         except Exception as exc:
             return {"success": False, "content": "无法取得原图：" + self._redact(str(exc))[:300]}
+        if not self._current(generation):
+            return {"success": False, "content": "插件生命周期已更改，本次未提交。"}
         source_count = len(images)
         if not images:
             return {"success": False, "content": "没有取得聊天原图，未提交；角色参考不能代替待修改原图。"}
@@ -1020,10 +1132,10 @@ class NekoDraw(MaiBotPlugin):
             if not settings[0] or not settings[1]:
                 return {"success": False, "content": "未启用或配置角色参考图，本次未提交；不会忽略自参考选项。"}
             try:
-                reference = await asyncio.to_thread(read_reference, settings[1])
+                reference = await image_work(read_reference, settings[1])
             except Exception:
                 return {"success": False, "content": "角色参考图无法读取或无效，本次未提交，不降级为普通编辑；请管理员检查参考图。"}
-            if settings != (self.config.self_portrait.enabled, self.config.self_portrait.reference_path):
+            if not self._current(generation) or settings != (self.config.self_portrait.enabled, self.config.self_portrait.reference_path):
                 return {"success": False, "content": "角色参考配置已更改，本次未提交。"}
             images = [*images, reference]
             text = portrait_edit_prompt(text, source_count)
@@ -1084,8 +1196,8 @@ class NekoDraw(MaiBotPlugin):
         active = self._active_task(stream_id)
         if active is not None:
             return False, "上一张还没画完。\n" + active.summary(), True
-        task = self._start_task(stream_id, payload, sender)
-        return True, "已经开始画了，画好会直接发图。\n" + task.summary(), True
+        result = await self.draw(prompt=payload, stream_id=stream_id, user_id=sender)
+        return bool(result['success']), result['content'], True
 
 
 def create_plugin() -> NekoDraw:

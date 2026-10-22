@@ -121,7 +121,7 @@ def authenticate(packet, directory):
         raise ValueError("unauthorized") from None
 
 
-def consume(directory, body, nonce, clock=time.time):
+def consume(directory, body, nonce, clock=time.time, *, allow_new=True):
     """Original packet replay rejects; re-signed request returns its old task ID."""
     path = Path(directory) / "life-admission.db"
     if path.is_symlink():
@@ -155,6 +155,9 @@ def consume(directory, body, nonce, clock=time.time):
             if old != (body["session_id"], digest):
                 raise ValueError("idempotency_conflict")
             return False
+        if not allow_new:
+            # Roll back the nonce too: a busy request was never admitted.
+            raise ValueError("admission_busy")
         if db.execute("SELECT count(*) FROM requests").fetchone()[0] >= 1000000:
             raise ValueError("admission_capacity")
         db.execute(

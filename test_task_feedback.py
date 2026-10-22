@@ -88,7 +88,7 @@ class TaskFeedback(unittest.IsolatedAsyncioTestCase):
     async def test_explicit_rate_limit_still_retries_with_redacted_log(self):
         self.bot.config.general.retry_times = 1
         self.bot.config.openai.api_key = 'private-test-key'
-        call = AsyncMock(side_effect=[RuntimeError('HTTP 429 private-test-key'), b'image'])
+        call = AsyncMock(side_effect=[self.mod.GenerationNotSubmitted('HTTP 429：private-test-key'), b'image'])
         with patch.object(self.mod.asyncio, 'sleep', AsyncMock()):
             self.assertEqual(await self.bot._call_with_retry(self.task, 'test', call), b'image')
         self.assertEqual(call.await_count, 2)

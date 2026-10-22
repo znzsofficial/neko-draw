@@ -312,6 +312,13 @@ class Providers(unittest.IsolatedAsyncioTestCase):
         self.mod = mod
         self.bot = object.__new__(mod.NekoDraw)
 
+    def admission_fixture(self, bot):
+        bot._generation_id = lambda: 0
+        bot._current = lambda generation: True
+        bot._reserve = lambda stream: True
+        bot._reservations = {}
+        return bot
+
     async def test_edit_tool_accepts_gif_sticker_without_generation(self):
         task = types.SimpleNamespace(summary=lambda: 'submitted')
         start = Mock(return_value=task)
@@ -320,7 +327,7 @@ class Providers(unittest.IsolatedAsyncioTestCase):
             ctx=types.SimpleNamespace(call_capability=AsyncMock(return_value={'message': sticker(animation('GIF'))})),
             _stream_id=lambda kw: 'chat', _active_task=lambda stream: None,
             _image_cache=ImageCache(), _start_task=start, _redact=str)
-        result = await self.mod.NekoDraw.edit_image(bot, prompt='换背景，保留人物', source_message_id='sticker', user_id='user')
+        result = await self.mod.NekoDraw.edit_image(self.admission_fixture(bot), prompt='换背景，保留人物', source_message_id='sticker', user_id='user')
         self.assertTrue(result['success'])
         args = start.call_args.args
         self.assertEqual(args[:3], ('chat', '换背景，保留人物', 'user'))
@@ -334,7 +341,7 @@ class Providers(unittest.IsolatedAsyncioTestCase):
         bot = types.SimpleNamespace(config=types.SimpleNamespace(plugin=types.SimpleNamespace(enabled=True)),
                                     ctx=types.SimpleNamespace(call_capability=cap), _stream_id=lambda kw: 'chat',
                                     _active_task=lambda stream: None, _image_cache=ImageCache(), _start_task=start, _redact=str)
-        result = await self.mod.NekoDraw.edit_image(bot, prompt='换背景', source_message_id='tool-media-2', source_image_index=1)
+        result = await self.mod.NekoDraw.edit_image(self.admission_fixture(bot), prompt='换背景', source_message_id='tool-media-2', source_image_index=1)
         self.assertTrue(result['success'])
         self.assertEqual(start.call_args.args[3], [PNG])
         cap.assert_awaited_once_with('maisaka.context.resolve_image', stream_id='chat', source_id='tool-media-2', index=1)
@@ -377,6 +384,7 @@ class Providers(unittest.IsolatedAsyncioTestCase):
         post = AsyncMock(return_value={'candidates': [{'content': {'parts': [{'inlineData': {'data': encoded}}]}}]})
         bot = types.SimpleNamespace(config=types.SimpleNamespace(gemini=self.mod.GeminiConfig(api_key='test')),
                                     _post_json=post)
+        bot._gemini_result = self.bot._gemini_result
         result = await self.mod.NekoDraw._gemini_native(bot, 'edit background', [PNG])
         self.assertEqual(result, PNG)
         parts = post.call_args.args[1]['contents'][0]['parts']

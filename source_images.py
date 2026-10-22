@@ -1,12 +1,15 @@
 """Resolve real images inside one MaiBot chat; never turn descriptions into inputs."""
 import base64
-import asyncio
 import io
 import time
 import warnings
 from collections import OrderedDict
 
 from PIL import Image
+try:
+    from .resource_budget import image_work
+except ImportError:  # Standalone offline tests.
+    from resource_budget import image_work
 
 MAX_BYTES = 10 * 1024 * 1024
 MAX_IMAGES = 4
@@ -31,7 +34,7 @@ async def resolve_context_image(ctx, stream_id, source_id, index=0):
     if not isinstance(image, dict):
         raise ValueError('宿主未返回上下文图片字节')
     # Reuse the same bounded Base64, pixel, format and animation validation.
-    images = await asyncio.to_thread(extract, {'message_segments': [dict(image, type='image')]})
+    images = await image_work(extract, {'message_segments': [dict(image, type='image')]})
     if len(images) != 1:
         raise ValueError('宿主未返回一张可读取的上下文图片')
     return images
@@ -196,7 +199,7 @@ async def resolve_images(ctx, stream_id, message_id='', current=None, cache=None
         if not authoritative and mid in own_images:
             images = list(own_images[mid])
         else:
-            images = await asyncio.to_thread(extract, message)
+            images = await image_work(extract, message)
             if images:
                 # Host may have compressed the image since the receive hook.
                 # Prefer fresh bytes rather than supplying two versions.
