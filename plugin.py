@@ -25,7 +25,7 @@ from .life_authorization import authenticate as authenticate_life, consume as co
 from .life_authorization import target_allowed as life_target_allowed, target_policy as life_target_policy
 from .self_reference import read_reference, portrait_prompt, portrait_edit_prompt
 from .focus_scope import items_for_scope, planner_scopes
-from .resource_budget import MAX_ADMITTED, MAX_GENERATING, MAX_PROMPT_CHARS, image_work
+from .resource_budget import MAX_ADMITTED, MAX_GENERATING, MAX_PROMPT_CHARS, deadline_slot, image_work, thread_work
 
 
 MARKDOWN_IMAGE = re.compile(r"!\[[^\]]*]\(([^)\s]+)\)")
@@ -40,6 +40,10 @@ class GenerationNotSubmitted(RuntimeError):
     """Explicit rejection or connection establishment failure; fallback is safe."""
 
 
+class AdmissionExpired(RuntimeError):
+    """Local work expired before its first generation attempt, never submitted."""
+
+
 def admitted(method):
     """Reserve before any asynchronous source/portrait preprocessing."""
     @wraps(method)
@@ -52,6 +56,8 @@ def admitted(method):
             return {"success": False, "content": "任务繁忙或全局容量已满，本次未提交，请稍后再试。"}
         try:
             return await method(self, *args, **kwargs)
+        except AdmissionExpired:
+            return {"success": False, "content": "预处理或排队已过期，未提交供应商，请按需重新请求。"}
         finally:
             self._reservations.pop(stream, None)
     return wrapped
@@ -171,6 +177,8 @@ class DrawTask:
         self.updated = now
         self.terminal_at: Optional[float] = None
         self.terminal_hint_used = False
+        self.admission_deadline: Optional[float] = None
+        self.life_policy = None
 
     def touch(self, status: str, **fields: Any) -> None:
         if status in {'succeeded', 'failed', 'unknown'} and self.status not in {'succeeded', 'failed', 'unknown'}:
@@ -229,14 +237,17 @@ class NekoDraw(MaiBotPlugin):
         return (generation == self._generation_id() and not getattr(self, '_life_closed', False)
                 and self.config.plugin.enabled)
 
-    def _reserve(self, stream):
+    def _reserve(self, stream, *, deadline=None):
         if not hasattr(self, '_reservations'):
             self._reservations = {}
         occupied = set(self._reservations) | {t.stream_id for t in self._tasks.values()
                                                if t.status in {'queued', 'running', 'retrying'}}
         if stream in occupied or len(occupied) >= MAX_ADMITTED:
             return False
-        self._reservations[stream] = self._generation_id()
+        self._reservations[stream] = (
+            self._generation_id(),
+            time.monotonic() + self.config.general.timeout if deadline is None else deadline,
+        )
         return True
 
     @HookHandler("chat.receive.before_process", name="neko_source_images",
@@ -324,9 +335,9 @@ class NekoDraw(MaiBotPlugin):
         except Exception as exc:
             raise GenerationUncertain("提交后响应读取失败；执行结果未知，不重新生成") from exc
         if response.status == 400:
-            raise PromptRejected("HTTP 400：" + self._redact(raw.decode('utf-8', 'replace'))[:500])
+            raise PromptRejected("HTTP 400：" + self._error_text(raw))
         if response.status in {401, 403, 404, 405, 415, 422, 429}:
-            raise GenerationNotSubmitted(f"HTTP {response.status}：" + self._redact(raw.decode('utf-8', 'replace'))[:500])
+            raise GenerationNotSubmitted(f"HTTP {response.status}：" + self._error_text(raw))
         if response.status != 200:
             raise GenerationUncertain(f"HTTP {response.status}：供应商是否已执行未知，不自动重试或切换接口")
         try:
@@ -680,16 +691,21 @@ class NekoDraw(MaiBotPlugin):
         if getattr(self, '_life_pending', 0) >= MAX_ADMITTED:
             return {'success': False, 'status': 'busy'}
         self._life_pending = getattr(self, '_life_pending', 0) + 1
+        deadline = time.monotonic() + self.config.general.timeout
         try:
-            return await self._admit_life(packet)
+            return await self._admit_life(packet, deadline)
+        except TimeoutError:
+            return {'success': False, 'status': 'expired'}
         finally:
             self._life_pending -= 1
 
-    async def _admit_life(self, packet):
+    async def _admit_life(self, packet, deadline):
         generation = self._generation_id()
-        async with self._life_lock:
+        async with deadline_slot(self._life_lock, deadline):
             if not self._current(generation) or not self.config.life.enabled:
                 return {'success': False, 'status': 'disabled'}
+            if time.monotonic() >= deadline:
+                return {'success': False, 'status': 'expired'}
             reserved = False
             session = ''
             try:
@@ -700,8 +716,10 @@ class NekoDraw(MaiBotPlugin):
                     return {'success': False, 'status': 'session_denied'}
                 if not self._current(generation) or not self._life_policy_current(policy):
                     return {'success': False, 'status': 'cancelled'}
-                reserved = self._reserve(session)
-                fresh = await asyncio.to_thread(consume_life, self.ctx.paths.data_dir, body, nonce, allow_new=reserved)
+                if time.monotonic() >= deadline:
+                    return {'success': False, 'status': 'expired'}
+                reserved = self._reserve(session, deadline=deadline)
+                fresh = await thread_work(consume_life, self.ctx.paths.data_dir, body, nonce, allow_new=reserved)
                 task_id = body['request_id']
                 if not fresh:
                     task = self._tasks.get(task_id)
@@ -710,8 +728,13 @@ class NekoDraw(MaiBotPlugin):
                     return {'success': False, 'status': 'cancelled'}
                 task = DrawTask(task_id, session, body['prompt'], 'neko.life')
                 task.generation = generation
+                task.admission_deadline = deadline
+                task.life_policy = policy
                 task.max_attempts = self.config.general.retry_times + 1
                 self._remember_task(task)
+                if time.monotonic() >= deadline:
+                    task.touch('failed', error='准入等待已过期，未提交供应商')
+                    return {'success': False, 'status': 'expired', 'task_id': task_id}
                 self._runners[task_id] = asyncio.create_task(self._run_task(task))
                 return {'success': True, 'status': 'submitted', 'task_id': task_id}
             except ValueError as exc:
@@ -737,8 +760,14 @@ class NekoDraw(MaiBotPlugin):
         owned = stream_id not in getattr(self, '_reservations', {})
         if owned and not self._reserve(stream_id):
             raise ValueError('全局任务容量已满，未提交')
+        generation, deadline = self._reservations[stream_id]
+        if generation != self._generation_id() or time.monotonic() >= deadline:
+            if owned:
+                self._reservations.pop(stream_id, None)
+            raise AdmissionExpired
         task = DrawTask(uuid.uuid4().hex[:8], stream_id, prompt, user_id)
         task.generation = self._generation_id()
+        task.admission_deadline = deadline
         task.images = images or []
         task.max_attempts = self.config.general.retry_times + 1
         self._remember_task(task)
@@ -753,20 +782,47 @@ class NekoDraw(MaiBotPlugin):
         try:
             if not hasattr(self, '_generation_slots'):
                 self._generation_slots = asyncio.Semaphore(MAX_GENERATING)
-            async with self._generation_slots:
+            deadline = task.admission_deadline
+            if deadline is None:  # Legacy/in-memory test tasks, not a new admission.
+                deadline = time.monotonic() + self.config.general.timeout
+                task.admission_deadline = deadline
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AdmissionExpired
+            try:
+                async with asyncio.timeout(remaining):
+                    await self._generation_slots.acquire()
+            except TimeoutError as exc:
+                raise AdmissionExpired from exc
+            try:
                 if not self._current(generation):
                     raise asyncio.CancelledError
+                if task.life_policy is not None:
+                    if not self._life_policy_current(task.life_policy):
+                        raise RuntimeError('Life授权已撤销，未提交供应商')
+                    if not await life_target_allowed(self.ctx, task.stream_id, task.life_policy):
+                        raise RuntimeError('Life目标授权已失效，未提交供应商')
+                    if not self._current(generation):
+                        raise asyncio.CancelledError
+                    if not self._life_policy_current(task.life_policy):
+                        raise RuntimeError('Life授权已撤销，未提交供应商')
+                if time.monotonic() >= deadline:
+                    raise AdmissionExpired
                 image, provider = await self._generate(task.prompt, task)
                 if not self._current(generation):
                     raise asyncio.CancelledError
                 sending = True
                 await self._send(image, task.stream_id, task.display_prompt)
+            finally:
+                self._generation_slots.release()
             task.touch("succeeded", provider=provider, error="")
             self.ctx.logger.info("任务 %s 已用 %s 发送", task.task_id, provider)
         except asyncio.CancelledError:
             uncertain = sending or task.status in {"running", "retrying"}
             task.touch("unknown" if uncertain else "failed", error="任务已取消；已发起的外部执行或发送结果未知，不自动重试或补发" if uncertain else "插件已卸载，任务取消")
             raise
+        except AdmissionExpired:
+            task.touch('failed', error='预处理或排队已过期，未提交供应商，请按需重新请求')
         except GenerationUncertain as exc:
             task.touch("unknown", error=self._redact(str(exc)))
         except PromptRejected as exc:
@@ -818,29 +874,44 @@ class NekoDraw(MaiBotPlugin):
         return {"action": "continue", "modified_kwargs": kwargs}
 
     def _redact(self, message: str) -> str:
-        for secret in (self.config.openai.api_key.strip(), self.config.gemini.api_key.strip()):
+        for secret in sorted((self.config.openai.api_key.strip(), self.config.gemini.api_key.strip()), key=len, reverse=True):
             if secret:
                 message = message.replace(secret, "***")
         return message
 
-    @staticmethod
-    def _api_error_detail(raw: str) -> str:
-        body = raw.split("：", 1)[-1].strip()
+    def _api_error_detail(self, raw: str) -> str:
+        body = (raw.split("：", 1)[-1] if raw.startswith('HTTP ') else raw).strip()
         try:
             data = json.loads(body)
         except Exception:
             return ""
+        return self._decoded_error_detail(data)
+
+    def _decoded_error_detail(self, data) -> str:
         if not isinstance(data, dict):
             return ""
         error = data.get("error")
         if isinstance(error, dict):
-            return str(error.get("message") or error.get("code") or error.get("type") or "").strip()
+            return self._redact(str(error.get("message") or error.get("code") or error.get("type") or "").strip())
         if isinstance(error, str):
-            return error.strip()
-        return str(data.get("message") or "").strip()
+            return self._redact(error.strip())
+        return self._redact(str(data.get("message") or "").strip())
+
+    def _error_text(self, raw: bytes) -> str:
+        text = raw.decode('utf-8', 'replace')  # read_response already bounds bytes.
+        try:
+            data = json.loads(text)
+        except Exception:
+            return self._redact(text)[:500]
+        else:
+            # Decode JSON escapes before redaction/truncation; expose only a
+            # whitelisted detail, never serialize the supplier's entire object.
+            detail = self._decoded_error_detail(data) or '接口未提供可用错误说明'
+            text = json.dumps({'error': {'message': detail}}, ensure_ascii=False)
+        return self._redact(text)[:500]
 
     def _policy_feedback(self, prompt: str, raw: str) -> str:
-        detail = self._api_error_detail(self._redact(raw))
+        detail = self._redact(self._api_error_detail(self._redact(raw)))
         lines = [
             "已知事实：生图接口返回 HTTP 400；该任务失败，未收到可发送的新图片。",
             "源图消息 ID 仅用于本地读取原图，不会作为消息 ID 传给生图接口。不能仅凭 HTTP 400 断言源图 ID 错误。",
