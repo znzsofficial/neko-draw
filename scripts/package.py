@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 FILES = (
     "_manifest.json", "plugin.py", "life_authorization.py", "public_http.py",
     "result_images.py", "source_images.py", "self_reference.py", "README.md", "LICENSE",
-    "config.example.toml",
+    "config.example.toml", "focus_scope.py",
 )
 
 

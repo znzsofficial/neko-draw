@@ -23,6 +23,7 @@ from .result_images import MAX_IMAGE_BYTES, decode_image, read_response, validat
 from .life_authorization import authenticate as authenticate_life, consume as consume_life
 from .life_authorization import target_allowed as life_target_allowed, target_policy as life_target_policy
 from .self_reference import read_reference, portrait_prompt, portrait_edit_prompt
+from .focus_scope import items_for_scope, planner_scopes
 
 
 MARKDOWN_IMAGE = re.compile(r"!\[[^\]]*]\(([^)\s]+)\)")
@@ -690,8 +691,14 @@ class NekoDraw(MaiBotPlugin):
         changed = self._inject_task_status(kwargs)
         items = kwargs.get("items")
         messages = kwargs.get("messages")
-        if self.config.plugin.enabled and self._is_draw_turn(items if isinstance(items, list) else None, messages if isinstance(messages, list) else None):
+        focused = not self._stream_id(kwargs)
+        draw_scopes = [sid for sid in planner_scopes('', kwargs.get('tool_definitions'))
+                       if self._is_draw_turn(items_for_scope(items, sid), None)] if focused else []
+        draw_turn = bool(draw_scopes) if focused else self._is_draw_turn(items if isinstance(items, list) else None, messages if isinstance(messages, list) else None)
+        if self.config.plugin.enabled and draw_turn:
             instruction = self._planner_instruction(self.config.self_portrait.enabled)
+            if focused:
+                instruction = '仅针对以下目标聊天的本次绘图请求（不是自动执行授权）：' + json.dumps(draw_scopes) + '\n' + instruction
             draw_changed = False
             if isinstance(items, list) and instruction not in "\n".join(self._item_text(item) for item in items):
                 items.append(self._system_item(instruction))
@@ -751,6 +758,32 @@ class NekoDraw(MaiBotPlugin):
         """
         stream_id = self._stream_id(kwargs)
         marker = "[neko.draw 当前任务状态]"
+        if not stream_id:
+            changed = False
+            for key, role_key, role_value, read in (
+                ('items', 'item_type', 'SystemMessageItem', self._item_text),
+                ('messages', 'role', 'system', self._message_text),
+            ):
+                values = kwargs.get(key)
+                if isinstance(values, list):
+                    fresh = [value for value in values if not (isinstance(value, dict)
+                             and value.get(role_key) == role_value and read(value).startswith(marker))]
+                    changed |= len(fresh) != len(values)
+                    kwargs[key] = fresh
+            if not any(isinstance(kwargs.get(key), list) for key in ('items', 'messages')):
+                return changed
+            for scope in planner_scopes('', kwargs.get('tool_definitions')):
+                scoped = {'session_id': scope, 'items': []}
+                if not self._inject_task_status(scoped):
+                    continue
+                for item in scoped['items']:
+                    notice = marker + '\n目标 session_id=' + json.dumps(scope) + '\n' + self._item_text(item)[len(marker):]
+                    if isinstance(kwargs.get('items'), list):
+                        kwargs['items'].append(self._system_item(notice))
+                    if isinstance(kwargs.get('messages'), list):
+                        kwargs['messages'].append({'role': 'system', 'content': notice})
+                    changed = True
+            return changed
         items = kwargs.get("items")
         messages = kwargs.get("messages")
         changed = False
