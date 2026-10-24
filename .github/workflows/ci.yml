@@ -2,17 +2,56 @@ name: Tests and source package
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      full:
+        description: Run the complete supported compatibility matrix
+        type: boolean
+        default: false
+  schedule:
+    - cron: '29 3 * * *'
 permissions:
   contents: read
+concurrency:
+  group: tests-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
-  test:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      runtime: ${{ steps.changes.outputs.runtime }}
+      full: ${{ steps.changes.outputs.full }}
+      matrix: ${{ steps.changes.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: changes
+        run: python .github/ci_policy.py classify --plugin neko-draw --workflow ci.yml
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+  docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: python .github/ci_policy.py docs
+  tests:
+    name: runtime (${{ matrix.case }})
+    needs: changes
+    if: needs.changes.outputs.runtime == 'true'
+    timeout-minutes: 15
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-        python: ['3.12', '3.14']
-        sdk: ['==2.12.0', '>=2.12,<3']
+      matrix: ${{ fromJSON(needs.changes.outputs.matrix) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1; verified via official API
         with:
@@ -21,7 +60,37 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Install real SDK and runtime/test dependencies
-        run: python -m pip install "maibot-plugin-sdk${{ matrix.sdk }}" "aiohttp>=3.12" "httpx>=0.26" "Pillow>=10" tzdata
-      - run: python scripts/check.py
-      - name: Build allowlisted ZIP and import extracted plugin with real SDK
+        run: python -m pip install "maibot-plugin-sdk${{ matrix.sdk_spec }}" "aiohttp>=3.12" "httpx>=0.26" "Pillow>=10" tzdata "ruff==0.15.11"
+      - run: python -m pip check
+      - name: Run tests
+        run: python scripts/check.py
+      - name: Lint
+        run: python -m ruff check --select E9,F63,F7,F82 .
+      - name: Format CI policy
+        run: python -m ruff format --check .github
+      - name: Verify source package
         run: python scripts/package.py
+  ci-gate:
+    if: always()
+    needs: [changes, docs, tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps: &gate-steps
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: python .github/ci_policy.py gate
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+  publish-gate:
+    if: always() && needs.changes.outputs.runtime == 'true' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: [changes, docs, tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps: *gate-steps
+  compatibility-proof:
+    if: always() && needs.changes.outputs.full == 'true' && needs.tests.result == 'success' && needs.docs.result == 'success'
+    needs: [changes, docs, tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps: *gate-steps

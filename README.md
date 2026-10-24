@@ -121,7 +121,7 @@ Linux/Windows×Python3.12/3.14完整59项回归通过。提醒终态边界改用
 
 ## CI、离线回归与源码包
 
-GitHub Actions 在 Ubuntu/Windows × Python 3.12/3.14 × SDK `==2.12.0`/`>=2.12,<3` 共8档运行。
+日常源码CI用Linux生产Python3.14.4/SDK2.16.0与Windows最低Python3.12/SDK2.12两组跑完整自有回归、依赖/lint和包导入；原8组兼容矩阵保留在v标签、手动full及有源码变化的夜间验证，另保留固定生产组合，不把latest当线上。
 SDK 的 PyPI 包名是 `maibot-plugin-sdk`，导入名为 `maibot_sdk`；必须安装真实 SDK，不以 stub 替代。
 
 ```sh
@@ -132,7 +132,7 @@ python scripts/package.py
 python scripts/package.py --output neko-draw.zip
 ```
 
-门禁要求至少140项测试、0 skip、0失败，防止缺SDK后关键用例被跳过或发现0项仍成功。
+门禁要求关键权限/公网传输/编辑/去重/共享Focus/打包测试组实际被发现并成功执行，0意外skip、0失败；不用固定总用例数证明正确。纯根目录/docs下Markdown只查本地链接，不获得源码发布资格；源码发布仍须同main提交及实际通过的核心测试/包验证/ci-gate/publish-gate。受控手动验证同HEAD可用于文档HEAD发版，不做空提交；不部署或执行真实模型/QQ操作。
 `tzdata` 显式安装，避免Windows与Linux时区数据库差异。新增公网下载回归全部使用MockTransport/假会话：
 混合公网/内网DNS、空解析、IPv4映射、当前机器地址、逐跳验证、DNS重绑定、重定向上限、固定IP及Host/TLS SNI、
 代理传输参数、分块响应限额；不访问测试域名/真实供应商、不付费生成、不发送QQ。共享`public_http.py`未修改。
